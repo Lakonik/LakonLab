@@ -1,41 +1,45 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import os
 import time
 import mimetypes
 import tempfile
-import subprocess
-import numpy as np
-import imageio
-import boto3
-import mmcv
-import torch.distributed as dist
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from io import BytesIO
 from functools import wraps
 from typing import Generator, Union, Optional, Tuple
+
+import numpy as np
+import imageio
+import boto3
 from PIL import Image
 from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+import torch.distributed as dist
 from torch.hub import download_url_to_file
 from huggingface_hub import hf_hub_download
+
+import mmcv
 from mmcv.fileio import BaseStorageBackend, FileClient
-from mmgen.utils.io_utils import MMGEN_CACHE_DIR
 
 
-AWS_REGION = os.getenv('AWS_REGION')
-AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-AWS_SESSION_TOKEN = os.getenv('AWS_SESSION_TOKEN')
-AWS_PROFILE = os.getenv('AWS_PROFILE')
 S3_MULTIPART_THRESHOLD = 5 * 2**30  # 5GB
+S3_MULTIPART_CHUNKSIZE = 5 * 2**30  # 5GB
 
 TMP_DIR = '/dev/shm' if os.path.isdir('/dev/shm') else tempfile.gettempdir()
-S3_TRANSFER_CONFIG = TransferConfig(multipart_threshold=S3_MULTIPART_THRESHOLD)
+S3_TRANSFER_CONFIG = TransferConfig(
+    preferred_transfer_client='classic',  # avoiding crt, which may be incompatible with `fork` in dataloader workers
+    multipart_threshold=S3_MULTIPART_THRESHOLD,
+    multipart_chunksize=S3_MULTIPART_CHUNKSIZE,
+)
+
+LAKONLAB_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache', 'lakonlab')
+AWS_SHARED_CREDENTIALS_FILE = os.path.join(os.path.expanduser('~'), '.aws', 'credentials')
 
 
 def retry(tries=5, delay=3, exceptions=(Exception,)):
@@ -55,6 +59,14 @@ def retry(tries=5, delay=3, exceptions=(Exception,)):
     return decorator
 
 
+def _refresh_s3_client(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        self._refresh_client_if_credentials_file_changed()
+        return func(self, *args, **kwargs)
+    return wrapper
+
+
 @retry()
 def _download_from_url(url, dest_path, hash_prefix):
     download_url_to_file(url, dest_path, hash_prefix, progress=True)
@@ -62,7 +74,7 @@ def _download_from_url(url, dest_path, hash_prefix):
 
 def download_from_url(url,
                       dest_path=None,
-                      dest_dir=MMGEN_CACHE_DIR,
+                      dest_dir=LAKONLAB_CACHE_DIR,
                       hash_prefix=None):
     """Modified from MMGeneration.
     """
@@ -100,26 +112,11 @@ def download_from_url(url,
 
 
 @retry()
-def _download_from_huggingface(repo_id, repo_filename):
-    cached_file = hf_hub_download(repo_id=repo_id, filename=repo_filename)
-    return cached_file
-
-
 def download_from_huggingface(filename):
     filename = filename.replace('huggingface://', '').split('/')
     repo_id = '/'.join(filename[:2])
     repo_filename = '/'.join(filename[2:])
-    is_dist = dist.is_available() and dist.is_initialized()
-    if is_dist:
-        local_rank = dist.get_node_local_rank()
-    else:
-        local_rank = 0
-    if local_rank == 0:
-        cached_file = _download_from_huggingface(repo_id, repo_filename)
-    if is_dist:
-        dist.barrier()
-    if local_rank > 0:
-        cached_file = _download_from_huggingface(repo_id, repo_filename)
+    cached_file = hf_hub_download(repo_id=repo_id, filename=repo_filename)
     return cached_file
 
 
@@ -128,31 +125,67 @@ class S3Backend(BaseStorageBackend):
     _allow_symlink = True
 
     def __init__(self, anonymous: bool = False):
-        if anonymous:
-            config = Config(region_name=AWS_REGION, signature_version=UNSIGNED)
-            self._client = boto3.client(
-                's3',
-                config=config)
-        else:
-            config = Config(region_name=AWS_REGION)
-            if AWS_PROFILE:
-                session = boto3.Session(profile_name=AWS_PROFILE)
-                self._client = session.client(
-                    's3',
-                    aws_access_key_id=AWS_ACCESS_KEY_ID,
-                    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                    aws_session_token=AWS_SESSION_TOKEN,
-                    config=config)
-            else:
-                self._client = boto3.client(
-                    's3',
-                    aws_access_key_id=AWS_ACCESS_KEY_ID,
-                    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                    aws_session_token=AWS_SESSION_TOKEN,
-                    config=config)
+        self.anonymous = anonymous
+        self._credentials_file = None
+        self._credentials_file_mtime = None
+        self._client = self._new_client()
 
     def __del__(self):
+        if hasattr(self, '_client'):
+            self._client.close()
+
+    def _new_client(self):
+        region = os.getenv('AWS_REGION')
+        profile = os.getenv('AWS_PROFILE')
+        access_key = os.getenv('AWS_ACCESS_KEY_ID')
+        secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        session_token = os.getenv('AWS_SESSION_TOKEN')
+        credentials_file = (
+            os.getenv('AWS_SHARED_CREDENTIALS_FILE')
+            or AWS_SHARED_CREDENTIALS_FILE
+        )
+        self._credentials_file = credentials_file
+        self._credentials_file_mtime = self._get_credentials_file_mtime()
+
+        if self.anonymous:
+            config = Config(region_name=region, signature_version=UNSIGNED)
+            return boto3.Session().client('s3', config=config)
+
+        config = Config(region_name=region)
+        if profile:
+            session = boto3.Session(profile_name=profile)
+            return session.client('s3', config=config)
+
+        client_kwargs = dict(config=config)
+        if access_key and secret_key:
+            client_kwargs.update(
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                aws_session_token=session_token,
+            )
+        return boto3.Session().client('s3', **client_kwargs)
+
+    def _get_credentials_file_mtime(self):
+        if not self._credentials_file or not os.path.exists(self._credentials_file):
+            return None
+        return os.path.getmtime(self._credentials_file)
+
+    def _refresh_client(self) -> None:
         self._client.close()
+        self._client = self._new_client()
+
+    def _refresh_client_if_credentials_file_changed(self) -> None:
+        credentials_file = (
+            os.getenv('AWS_SHARED_CREDENTIALS_FILE')
+            or AWS_SHARED_CREDENTIALS_FILE
+        )
+        if credentials_file != self._credentials_file:
+            self._credentials_file = credentials_file
+            self._refresh_client()
+            return
+        mtime = self._get_credentials_file_mtime()
+        if mtime != self._credentials_file_mtime:
+            self._refresh_client()
 
     @staticmethod
     def _split_s3_url(s3_url):
@@ -171,6 +204,7 @@ class S3Backend(BaseStorageBackend):
         return extra_args
 
     @retry()
+    @_refresh_s3_client
     def get(self, filepath: Union[str, Path]) -> bytes:
         filepath = str(filepath)
         bucket, prefix = self._split_s3_url(filepath)
@@ -183,11 +217,12 @@ class S3Backend(BaseStorageBackend):
         return self.get(filepath).decode(encoding)
 
     @retry()
+    @_refresh_s3_client
     def put(self, obj: bytes, filepath: Union[str, Path]) -> None:
         filepath = str(filepath)
+        bucket, prefix = self._split_s3_url(filepath)
         extra_args = self._infer_s3_extra_args(filepath)
         if len(obj) < S3_MULTIPART_THRESHOLD:
-            bucket, prefix = self._split_s3_url(filepath)
             self._client.upload_fileobj(
                 BytesIO(obj),
                 bucket,
@@ -201,12 +236,13 @@ class S3Backend(BaseStorageBackend):
                 cached_file = tmp.name
                 tmp.write(obj)
             try:
-                cmd = ['aws', 's3', 'cp', cached_file, filepath]
-                if 'ContentType' in extra_args:
-                    cmd += ['--content-type', extra_args['ContentType']]
-                if 'ContentEncoding' in extra_args:
-                    cmd += ['--content-encoding', extra_args['ContentEncoding']]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+                self._client.upload_file(
+                    cached_file,
+                    bucket,
+                    prefix,
+                    Config=S3_TRANSFER_CONFIG,
+                    ExtraArgs=extra_args,
+                )
             finally:
                 os.remove(cached_file)
 
@@ -217,12 +253,14 @@ class S3Backend(BaseStorageBackend):
         self.put(bytes(obj, encoding=encoding), filepath)
 
     @retry()
+    @_refresh_s3_client
     def remove(self, filepath: Union[str, Path]) -> None:
         filepath = str(filepath)
         bucket, prefix = self._split_s3_url(filepath)
         self._client.delete_object(Bucket=bucket, Key=prefix)
 
     @retry()
+    @_refresh_s3_client
     def exists(self, filepath: Union[str, Path]) -> bool:
         filepath = str(filepath)
         bucket, prefix = self._split_s3_url(filepath)
@@ -280,6 +318,7 @@ class S3Backend(BaseStorageBackend):
             os.remove(f.name)
 
     @retry()
+    @_refresh_s3_client
     def list_dir_or_file(
             self,
             dir_path: Union[str, Path],
@@ -293,44 +332,55 @@ class S3Backend(BaseStorageBackend):
         if not dir_path.endswith('/'):
             dir_path += '/'
 
-        cmd = ['aws', 's3', 'ls', dir_path]
-        if recursive:
-            cmd.append('--recursive')
-            bucket, prefix = self._split_s3_url(dir_path)
-            prefix_len = len(prefix)
-        else:
-            prefix_len = 0
-
-        p = subprocess.run(cmd, text=True, capture_output=True)
-        if p.returncode == 0:
-            out = p.stdout
-        elif not p.stdout and not p.stderr:  # dir_path does not exist
-            out = ''
-        else:
-            raise subprocess.CalledProcessError(p.returncode, p.args, output=p.stdout, stderr=p.stderr)
-
+        bucket, prefix = self._split_s3_url(dir_path)
+        prefix_len = len(prefix)
         names = []
-        for line in out.splitlines():
-            if not line:
-                continue
+        paginator = self._client.get_paginator('list_objects_v2')
+        pagination_config = dict(Bucket=bucket, Prefix=prefix)
+        if not recursive:
+            pagination_config['Delimiter'] = '/'
 
-            ls = line.lstrip()
+        for page in paginator.paginate(**pagination_config):
+            if not recursive:
+                for obj in page.get('CommonPrefixes', []):
+                    key = obj['Prefix']
+                    name = key[prefix_len:].rstrip('/')
+                    if name:
+                        names.append(name)
 
-            if not recursive and ls.startswith('PRE '):
-                name = ls.split(maxsplit=1)[1].rstrip('/')
-            else:
-                parts = ls.split(maxsplit=3)
-                if len(parts) < 4:
-                    continue
-                key = parts[3]
-                name = key[prefix_len:] if prefix_len else key
-
-            names.append(name)
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                name = key[prefix_len:]
+                if name:
+                    names.append(name)
 
         return names
 
 
+class HuggingFaceBackend(BaseStorageBackend):
+
+    def get(self, filepath):
+        local_path = download_from_huggingface(filepath)
+        with open(local_path, 'rb') as f:
+            value_buf = f.read()
+        return value_buf
+
+    def get_text(self, filepath, encoding='utf-8'):
+        local_path = download_from_huggingface(filepath)
+        with open(local_path, encoding=encoding) as f:
+            value_buf = f.read()
+        return value_buf
+
+    @contextmanager
+    def get_local_path(self, filepath: str):
+        try:
+            yield download_from_huggingface(filepath)
+        finally:
+            pass
+
+
 FileClient.register_backend(name='s3', backend=S3Backend, force=True, prefixes='s3')
+FileClient.register_backend(name='huggingface', backend=HuggingFaceBackend, prefixes='huggingface')
 
 
 def save_image(image, filepath, file_client):
@@ -394,21 +444,6 @@ def load_images_parallel(filepaths, file_client):
 
 
 @retry()
-def _hf_model_loader(model_class, repo_id, **kwargs):
-    model = model_class.from_pretrained(repo_id, **kwargs)
-    return model
-
-
 def hf_model_loader(model_class, repo_id, **kwargs):
-    is_dist = dist.is_available() and dist.is_initialized()
-    if is_dist:
-        local_rank = dist.get_node_local_rank()
-    else:
-        local_rank = 0
-    if local_rank == 0:
-        model = _hf_model_loader(model_class, repo_id, **kwargs)
-    if is_dist:
-        dist.barrier()
-    if local_rank > 0:
-        model = _hf_model_loader(model_class, repo_id, **kwargs)
+    model = model_class.from_pretrained(repo_id, **kwargs)
     return model

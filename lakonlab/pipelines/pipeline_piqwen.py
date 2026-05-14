@@ -1,9 +1,10 @@
-# Copyright (c) 2025 Hansheng Chen
-
-import torch
+# Copyright (c) 2026 Hansheng Chen
 
 from typing import Dict, List, Optional, Union, Any, Callable
 from functools import partial
+
+import torch
+
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 from diffusers.utils import is_torch_xla_available
 from diffusers.models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
@@ -11,7 +12,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage import (
     QwenImagePipeline, QwenImagePipelineOutput)
 from lakonlab.models.diffusions.schedulers.flow_map_sde import FlowMapSDEScheduler
 from lakonlab.models.diffusions.piflow_policies import POLICY_CLASSES
-from .piflow_utils import PiFlowMixin
+from .utils import LakonLabMixin
 
 
 if is_torch_xla_available():
@@ -22,7 +23,7 @@ else:
     XLA_AVAILABLE = False
 
 
-class PiQwenImagePipeline(QwenImagePipeline, PiFlowMixin):
+class PiQwenImagePipeline(QwenImagePipeline, LakonLabMixin):
     r"""
     The policy-based QwenImage pipeline for text-to-image generation.
 
@@ -263,11 +264,9 @@ class PiQwenImagePipeline(QwenImagePipeline, PiFlowMixin):
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
-        timestep_id = 0
+
         with self.progress_bar(total=self.num_timesteps) as progress_bar:
             for i, (t_src, t_dst) in enumerate(zip(timesteps, timesteps_dst)):
                 if self.interrupt:
@@ -285,7 +284,6 @@ class PiQwenImagePipeline(QwenImagePipeline, PiFlowMixin):
                         encoder_hidden_states_mask=prompt_embeds_mask,
                         encoder_hidden_states=prompt_embeds,
                         img_shapes=img_shapes,
-                        txt_seq_lens=txt_seq_lens,
                         attention_kwargs=self.attention_kwargs,
                     )
 
@@ -315,9 +313,13 @@ class PiQwenImagePipeline(QwenImagePipeline, PiFlowMixin):
                 else:
                     raise ValueError(f'Unknown policy type: {self.policy_type}.')
 
-                latents_dst = self.policy_rollout(
-                    latents, sigma_t_src, sigma_t_dst, total_substeps,
-                    policy, seq_len=image_seq_len)
+                raw_t_src = self.scheduler.unwarp_t(
+                    sigma_t_src, seq_len=image_seq_len)
+                raw_t_dst = self.scheduler.unwarp_t(
+                    sigma_t_dst, seq_len=image_seq_len)
+                latents_dst, _, _ = policy.integrate(
+                    latents, sigma_t_src, raw_t_src, raw_t_dst, self.scheduler,
+                    seq_len=image_seq_len, total_substeps=total_substeps)
 
                 latents = self.scheduler.step(latents_dst, t_src, latents, return_dict=False)[0]
 

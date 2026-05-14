@@ -56,7 +56,7 @@ eval_interval = 400
 work_dir = f'work_dirs/{name}'
 
 train_cfg = dict(
-    gm_dropout=0.05,
+    policy_dropout=0.05,
     num_intermediate_states=2,
     teacher_test_cfg=dict(
         guidance_scale=3.2,
@@ -139,7 +139,7 @@ log_config = dict(
 
 custom_hooks = [
     dict(
-        type='ExponentialMovingAverageHookMod',
+        type='ExponentialMovingAverageHook',
         module_keys=('diffusion_ema', ),
         interp_mode='lerp',
         interval=1,
@@ -151,7 +151,7 @@ custom_hooks = [
 
 # use dynamic runner
 runner = dict(
-    type='DynamicIterBasedRunnerMod',
+    type='DynamicIterBasedRunner',
     pass_training_status=True,
     ckpt_trainable_only=True,
     ckpt_fp16=True,
@@ -160,7 +160,7 @@ runner = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = f'checkpoints/{name}/latest.txt'  # resume by default
+resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]
 module_wrapper = 'ddp'
 cudnn_benchmark = True

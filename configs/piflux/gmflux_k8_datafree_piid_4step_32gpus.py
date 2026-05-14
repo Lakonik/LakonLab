@@ -5,7 +5,7 @@ name = 'gmflux_k8_datafree_piid_4step_32gpus'
 model = dict(
     type='LatentDiffusionTextImage',
     vae=dict(
-        type='PretrainedVAE',
+        type='PretrainedVAEDecoder',
         model_name_or_path='black-forest-labs/FLUX.1-dev',
         subfolder='vae',
         freeze=True,
@@ -91,7 +91,7 @@ work_dir = f'work_dirs/{name}'
 train_cfg = dict(
     num_decay_iters=2000,
     window_substeps=3,
-    gm_dropout=0.1,
+    policy_dropout=0.1,
     num_intermediate_states=4,
     distilled_guidance_scale=3.5,
     teacher_test_cfg=dict(distilled_guidance_scale=3.5),
@@ -109,9 +109,20 @@ test_cfg = dict(
 data = dict(
     workers_per_gpu=2,
     train_dataloader=dict(samples_per_gpu=2),
+    test=dict(
+        type='ImagePrompt',
+        data_root='data/balancia_morgan_flux_embeds/',
+        cache_dir='',
+        cache_datalist_path='data/balancia_morgan_cache.json',
+        end_ind=128,
+        latent_size=(16, 96, 170),
+        repeat=2,
+        test_mode=True,
+    ),
     val_dataloader=dict(samples_per_gpu=1),
     test_dataloader=dict(samples_per_gpu=1),
     persistent_workers=True,
+    num_threads=1,
     prefetch_factor=2
 )
 checkpoint_config = dict(
@@ -122,7 +133,7 @@ checkpoint_config = dict(
     out_dir='checkpoints/')
 
 evaluation = []
-for data_split in ['val']:
+for data_split in ['val2', 'test']:
     for temperature in [0.3]:
         prefix = f'step4_temp{temperature}'
         evaluation.append(
@@ -135,6 +146,9 @@ for data_split in ['val']:
                         temperature=temperature,
                     )),
                 interval=eval_interval,
+                metrics=[dict(
+                    type='HPSv2',
+                    hps_version='v2.1')],
                 viz_dir=f'viz/{name}/{data_split}_{prefix}',
                 metric_cpu_offload=True,
                 save_best_ckpt=False))
@@ -150,7 +164,7 @@ log_config = dict(
 
 custom_hooks = [
     dict(
-        type='ExponentialMovingAverageHookMod',
+        type='ExponentialMovingAverageHook',
         module_keys=('diffusion_ema', ),
         interp_mode='lerp',
         interval=1,
@@ -161,5 +175,5 @@ custom_hooks = [
 ]
 
 load_from = None
-resume_from = f'checkpoints/{name}/latest.txt'  # resume by default
+resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]

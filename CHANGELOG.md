@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0] - 2026-05-12
+
+### Added
+- AsymFlow release.
+- JiT, RAE, and REPA-E model support and test configs.
+- DPGBench, GenEval, and HPSv3 benchmark exporters.
+- Media viewer pagination.
+
+### Changed
+- **Breaking:** Replace the MMGeneration model registry dependency with local LakonLab registries.
+- **Breaking:** Move model architectures from `lakonlab.models.architecture` to `lakonlab.models.architectures`.
+- Update FSDP/DDP wrappers, checkpoint loading/saving, runner utilities, and S3 retry/refresh behavior.
+
+### Fixed
+- Fixed multiple bugs and edge cases.
+
 ## [0.1.2] - 2026-01-18
 
 ### Added

@@ -12,11 +12,13 @@ import os
 import argparse
 import json
 from collections import OrderedDict
+
 from safetensors.torch import save_file
 from diffusers.utils import SAFETENSORS_WEIGHTS_NAME
 from mmcv import Config
 from mmcv.runner import _load_checkpoint
-from mmgen.models import build_module
+
+from lakonlab.models import build_module
 from lakonlab.runner.checkpoint import exists_ckpt
 from lakonlab.utils import rgetattr
 

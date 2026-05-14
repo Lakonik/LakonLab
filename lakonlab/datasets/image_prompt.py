@@ -1,28 +1,32 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
+import warnings
 import logging
 import os
 import math
-import numpy as np
-import torch
-import torch.nn.functional as F
-import zstandard as zstd
 import pickle
 import gzip
 import orjson
-import mmcv
+import zstandard as zstd
+from io import BytesIO
+from typing import Optional, Tuple, Union
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 import torch.storage
 torch.storage.UntypedStorage.dtype = torch.uint8  # hot patch for torch 2.6 deserialization
 
-from io import BytesIO
-from typing import Optional, Tuple, Union
-from PIL import Image
-from torch.utils.data import Dataset
 from datasets import load_dataset, DatasetDict, Dataset as HFDataset
+import mmcv
 from mmcv.fileio import FileClient
 from mmcv.parallel import DataContainer as DC
-from mmgen.utils import get_root_logger
-from mmgen.datasets.builder import DATASETS
+
+from .builder import DATASETS
+from lakonlab.utils import get_root_logger
 from lakonlab.utils.io_utils import load_image
 
 
@@ -88,6 +92,8 @@ class ImagePrompt(Dataset):
         bucketize (bool): If True, enables bucketing in `DistributedSampler` so that
             each rank receives samples of the same size. Expects `"size_idx"` in JSONL
             datalists and collects bucket ids. Defaults to False.
+        prompt_key (str): Prompt column name in prompt-dataset mode.
+            Defaults to "prompt".
         test_mode (bool): If True, return deterministic noise per sample instead of
             reading/allocating real latents or images.
     """
@@ -124,12 +130,14 @@ class ImagePrompt(Dataset):
                  start_ind: Optional[int] = None,
                  end_ind: int = None,
                  bucketize: bool = False,
+                 prompt_key: str = 'prompt',
                  test_mode: bool = False):
         super().__init__()
         self.data_root = data_root
         self._file_client = None
 
         self.pad_seq_len = pad_seq_len
+        self.prompt_key = prompt_key
 
         self.cache_dir_path = self.cache_datalist_path = None
         self.prompt_dataset = self.image_dir_path = self.condition_image_dir_path = None
@@ -498,124 +506,134 @@ class ImagePrompt(Dataset):
         return self.repeat * (self.end_ind - self.start_ind)
 
     def __getitem__(self, idx):
-        mapped_idx = self._map_idx(idx)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given NumPy array is not writable, and PyTorch does not support non-writable tensors.*",
+                category=UserWarning,
+            )
 
-        prompt_data = None
+            mapped_idx = self._map_idx(idx)
 
-        if self.cache_dir_path is not None:
-            data_path = self.file_client.join_path(
-                self.cache_dir_path, f'{self.cache_datalist[mapped_idx]}.zst')
-            data_bytesio = BytesIO(self.file_client.get(data_path))
-            with zstd.ZstdDecompressor().stream_reader(data_bytesio) as f:
-                raw_data = pickle.load(f)
+            prompt_data = None
 
-            data = dict(
-                ids=DC(idx, cpu_only=True),
-                name=DC(raw_data['prompt'], cpu_only=True),
-                prompt_embed_kwargs=self.parse_prompt_embeds(raw_data))
+            if self.cache_dir_path is not None:
+                data_path = self.file_client.join_path(
+                    self.cache_dir_path, f'{self.cache_datalist[mapped_idx]}.zst')
+                data_bytesio = BytesIO(self.file_client.get(data_path))
+                with zstd.ZstdDecompressor().stream_reader(data_bytesio) as f:
+                    raw_data = pickle.load(f)
 
-            if not self.ignore_cached_latents:  # load latents
-                if 'latents' in raw_data:
-                    latents = raw_data['latents']
-                    if self.test_mode:
-                        latent_size = (latents.size(0), ) + self.calculate_scaled_latent_size(
-                            latents.shape[1:], self.image_scale_factor)
-                        data['noise'] = torch.randn(
-                            latent_size, dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
+                data = dict(
+                    ids=DC(idx, cpu_only=True),
+                    name=DC(raw_data['prompt'], cpu_only=True),
+                    prompt_embed_kwargs=self.parse_prompt_embeds(raw_data))
+
+                if not self.ignore_cached_latents:  # load latents
+                    if 'latents' in raw_data:
+                        latents = raw_data['latents']
+                        if self.test_mode:
+                            latent_size = (latents.size(0), ) + self.calculate_scaled_latent_size(
+                                latents.shape[1:], self.image_scale_factor)
+                            data['noise'] = torch.randn(
+                                latent_size, dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
+                        else:
+                            data['latents'] = latents.float()
+                            latents_scale = raw_data.get('latents_scale', None)
+                            if latents_scale is not None:
+                                data['latents'] = data['latents'] * latents_scale
+                            data['latents'] = self.scale_latent(data['latents'], self.image_scale_factor)
                     else:
-                        data['latents'] = latents.float()
-                        latents_scale = raw_data.get('latents_scale', None)
-                        if latents_scale is not None:
-                            data['latents'] = data['latents'] * latents_scale
-                        data['latents'] = self.scale_latent(data['latents'], self.image_scale_factor)
+                        if 'latent_size' in raw_data:
+                            latent_size = raw_data['latent_size']
+                            latent_size = (latent_size[0],) + self.calculate_scaled_latent_size(
+                                latent_size[1:], self.image_scale_factor)
+                        elif 'condition_latents' in raw_data:
+                            latent_size = raw_data['condition_latents'].shape
+                        else:
+                            latent_size = self.latent_size
+                        if self.test_mode:
+                            data['noise'] = torch.randn(
+                                latent_size, dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
+                        else:
+                            data['latents'] = torch.empty(latent_size, dtype=torch.float32)
+
+                if 'condition_latents' in raw_data:
+                    condition_latents = raw_data['condition_latents']
+                    data['condition_latents'] = condition_latents.float()
+                    condition_latents_scale = raw_data.get('condition_latents_scale', None)
+                    if condition_latents_scale is not None:
+                        data['condition_latents'] = data['condition_latents'] * condition_latents_scale
+                    data['condition_latents'] = self.scale_latent(
+                        data['condition_latents'], self.condition_image_scale_factor)
+
+            else:
+                prompt_data = self.prompt_dataset[mapped_idx]
+                prompt = prompt_data[self.prompt_key]
+                if 'prompt_kwargs' in prompt_data:
+                    prompt_kwargs = {k: DC(v, cpu_only=True) for k, v in prompt_data['prompt_kwargs'].items()}
                 else:
-                    if 'latent_size' in raw_data:
-                        latent_size = raw_data['latent_size']
-                        latent_size = (latent_size[0],) + self.calculate_scaled_latent_size(
-                            latent_size[1:], self.image_scale_factor)
-                    elif 'condition_latents' in raw_data:
-                        latent_size = raw_data['condition_latents'].shape
-                    else:
-                        latent_size = self.latent_size
-                    if self.test_mode:
-                        data['noise'] = torch.randn(
-                            latent_size, dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
-                    else:
-                        data['latents'] = torch.empty(latent_size, dtype=torch.float32)
+                    prompt_kwargs = dict(prompt=DC(prompt, cpu_only=True))
+                data = dict(
+                    ids=DC(idx, cpu_only=True),
+                    name=DC(prompt, cpu_only=True),
+                    prompt_kwargs=prompt_kwargs)
 
-            if 'condition_latents' in raw_data:
-                condition_latents = raw_data['condition_latents']
-                data['condition_latents'] = condition_latents.float()
-                condition_latents_scale = raw_data.get('condition_latents_scale', None)
-                if condition_latents_scale is not None:
-                    data['condition_latents'] = data['condition_latents'] * condition_latents_scale
-                data['condition_latents'] = self.scale_latent(
-                    data['condition_latents'], self.condition_image_scale_factor)
+            if self.image_dir_path is not None:
+                image_path = self.file_client.join_path(
+                    self.image_dir_path, self.image_datalist[mapped_idx] + self.image_extension)
+                image_size = self.image_sizes[mapped_idx] if self.image_sizes is not None else None
+                image = load_image(image_path, self.file_client, target_size=image_size)
+                image = np.moveaxis(image, -1, 0)  # channel first
+                if self.test_mode:
+                    data['noise'] = torch.randn(
+                        self.calculate_latent_size(
+                            self.calculate_scaled_image_size(image.shape[1:], self.image_scale_factor)),
+                        dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
+                else:
+                    images = torch.from_numpy(image)
+                    if images.dtype == torch.uint8:
+                        images = images.float() / 255.0
+                    assert torch.is_floating_point(images), f'Image dtype {images.dtype} not supported.'
+                    data['images'] = self.scale_image(images.float(), self.image_scale_factor)
+            elif 'latents' not in data and 'noise' not in data:  # allocate latents if not already loaded
+                if prompt_data is not None and 'height' in prompt_data and 'width' in prompt_data:
+                    image_spatial_size = (prompt_data['height'], prompt_data['width'])
+                    if 'frames' in prompt_data:
+                        image_spatial_size = (prompt_data['frames'],) + image_spatial_size
+                    latent_size = self.calculate_latent_size(
+                        self.calculate_scaled_image_size(image_spatial_size, self.image_scale_factor))
+                elif 'condition_latents' in data:
+                    latent_size = data['condition_latents'].shape
+                else:
+                    latent_size = self.latent_size
+                if self.test_mode:
+                    data['noise'] = torch.randn(
+                        latent_size, dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
+                else:
+                    data['latents'] = torch.empty(latent_size, dtype=torch.float32)
 
-        else:
-            prompt_data = self.prompt_dataset[mapped_idx]
-            if 'prompt_kwargs' in prompt_data:
-                prompt_kwargs = {k: DC(v, cpu_only=True) for k, v in prompt_data['prompt_kwargs'].items()}
-            else:
-                prompt_kwargs = dict(prompt=DC(prompt_data['prompt'], cpu_only=True))
-            data = dict(
-                ids=DC(idx, cpu_only=True),
-                name=DC(prompt_data['prompt'], cpu_only=True),
-                prompt_kwargs=prompt_kwargs)
+            if self.condition_image_dir_path is not None:
+                condition_image_path = self.file_client.join_path(
+                    self.condition_image_dir_path,
+                    self.condition_image_datalist[mapped_idx] + self.condition_image_extension)
+                condition_image_size = self.condition_image_sizes[mapped_idx] \
+                    if self.condition_image_sizes is not None else None
+                condition_image = load_image(condition_image_path, self.file_client, target_size=condition_image_size)
+                condition_image = np.moveaxis(condition_image, -1, 0)  # channel first
+                condition_images = torch.from_numpy(condition_image)
+                if condition_images.dtype == torch.uint8:
+                    condition_images = condition_images.float() / 255.0
+                assert torch.is_floating_point(condition_images), \
+                    f'Condition image dtype {condition_images.dtype} not supported.'
+                data['condition_images'] = self.scale_image(
+                    condition_images.float(), self.condition_image_scale_factor)
 
-        if self.image_dir_path is not None:
-            image_path = self.file_client.join_path(
-                self.image_dir_path, self.image_datalist[mapped_idx] + self.image_extension)
-            image_size = self.image_sizes[mapped_idx] if self.image_sizes is not None else None
-            image = load_image(image_path, self.file_client, target_size=image_size)
-            image = np.moveaxis(image, -1, 0)  # channel first
-            if self.test_mode:
-                data['noise'] = torch.randn(
-                    self.calculate_latent_size(
-                        self.calculate_scaled_image_size(image.shape[1:], self.image_scale_factor)),
-                    dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
-            else:
-                images = torch.from_numpy(image)
-                if images.dtype == torch.uint8:
-                    images = images.float() / 255.0
-                assert torch.is_floating_point(images), f'Image dtype {images.dtype} not supported.'
-                data['images'] = self.scale_image(images.float(), self.image_scale_factor)
-        elif 'latents' not in data and 'noise' not in data:  # allocate latents if not already loaded
-            if prompt_data is not None and 'height' in prompt_data and 'width' in prompt_data:
-                image_spatial_size = (prompt_data['height'], prompt_data['width'])
-                if 'frames' in prompt_data:
-                    image_spatial_size = (prompt_data['frames'],) + image_spatial_size
-                latent_size = self.calculate_latent_size(
-                    self.calculate_scaled_image_size(image_spatial_size, self.image_scale_factor))
-            elif 'condition_latents' in data:
-                latent_size = data['condition_latents'].shape
-            else:
-                latent_size = self.latent_size
-            if self.test_mode:
-                data['noise'] = torch.randn(
-                    latent_size, dtype=torch.float32, generator=torch.Generator().manual_seed(idx))
-            else:
-                data['latents'] = torch.empty(latent_size, dtype=torch.float32)
+            if self.negative_prompt_embed_kwargs is not None:
+                data.update(negative_prompt_embed_kwargs=self.negative_prompt_embed_kwargs)
+            if self.negative_prompt_kwargs is not None:
+                data.update(negative_prompt_kwargs={
+                    k: DC(v, cpu_only=True) for k, v in self.negative_prompt_kwargs.items()
+                })
 
-        if self.condition_image_dir_path is not None:
-            condition_image_path = self.file_client.join_path(
-                self.condition_image_dir_path,
-                self.condition_image_datalist[mapped_idx] + self.condition_image_extension)
-            condition_image_size = self.condition_image_sizes[mapped_idx] \
-                if self.condition_image_sizes is not None else None
-            condition_image = load_image(condition_image_path, self.file_client, target_size=condition_image_size)
-            condition_image = np.moveaxis(condition_image, -1, 0)  # channel first
-            condition_images = torch.from_numpy(condition_image)
-            if condition_images.dtype == torch.uint8:
-                condition_images = condition_images.float() / 255.0
-            assert torch.is_floating_point(condition_images), \
-                f'Condition image dtype {condition_images.dtype} not supported.'
-            data['condition_images'] = self.scale_image(
-                condition_images.float(), self.condition_image_scale_factor)
-
-        if self.negative_prompt_embed_kwargs is not None:
-            data.update(negative_prompt_embed_kwargs=self.negative_prompt_embed_kwargs)
-        if self.negative_prompt_kwargs is not None:
-            data.update(negative_prompt_kwargs=self.negative_prompt_kwargs)
-
-        return data
+            return data

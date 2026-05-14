@@ -1,11 +1,11 @@
-# Copyright (c) 2025 Hansheng Chen
-
-import torch
+# Copyright (c) 2026 Hansheng Chen
 
 from copy import deepcopy
-from accelerate import init_empty_weights
-from mmgen.models.builder import MODELS, build_module
 
+import torch
+from accelerate import init_empty_weights
+
+from .builder import MODELS, build_module
 from .base import BaseModel
 from lakonlab.utils import clone_params, tie_untrained_submodules, untie_all_parameters
 
@@ -21,6 +21,7 @@ class Diffusion2D(BaseModel):
                  train_cfg=None,
                  test_cfg=None):
         super().__init__()
+        diffusion = deepcopy(diffusion)
         diffusion.update(train_cfg=train_cfg, test_cfg=test_cfg)
         self.diffusion = build_module(diffusion)
         self.diffusion_use_ema = diffusion_use_ema

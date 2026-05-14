@@ -14,34 +14,28 @@ import argparse
 import multiprocessing as mp
 import platform
 import re
-import warnings
+from copy import deepcopy
 
-import cv2
-import mmcv
 import torch
-import torch.distributed as dist
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from copy import deepcopy
+import cv2
+import mmcv
 from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import get_dist_info, init_dist, load_checkpoint
 from mmcv.fileio import FileClient
 
-from mmgen.apis import set_random_seed
-from mmgen.core import build_metric
-from mmgen.datasets import build_dataset
-from mmgen.models import build_model
-from mmgen.utils import get_root_logger
+from lakonlab.models import build_model
+from lakonlab.utils import get_root_logger
+from lakonlab.evaluation import build_metric
 from lakonlab.evaluation.eval_hooks import evaluate
-from lakonlab.datasets import build_dataloader
-from lakonlab.parallel import apply_module_wrapper
+from lakonlab.datasets import build_dataset, build_dataloader, unique_dataloaders
+from lakonlab.parallel.utils import prepare_module_wrapper, apply_module_wrapper
 from lakonlab.runner.checkpoint import exists_ckpt, clear_checkpoint_cache
-
-_distributed_metrics = [
-    'FID', 'IS', 'FIDKID', 'PR', 'InceptionMetrics', 'ColorStats', 'HPSv2', 'VQAScore', 'CLIPSimilarity', 'HPSv3']
+from lakonlab.runner.utils import set_random_seed
 
 
 def parse_args():
@@ -51,7 +45,7 @@ def parse_args():
     parser.add_argument('--ckpt', help='checkpoint file')
     parser.add_argument(
         '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi'],
+        choices=['none', 'pytorch', 'slurm', 'mpi', 'flyte'],
         default='none',
         help='job launcher')
     group_gpus = parser.add_mutually_exclusive_group()
@@ -115,7 +109,8 @@ def setup_multi_processes(cfg):
     # set multi-process start method as `fork` to speed up the training
     if platform.system() != 'Windows':
         mp_start_method = cfg.get('mp_start_method', 'fork')
-        mp.set_start_method(mp_start_method)
+        if mp.get_start_method(allow_none=True) is None:
+            mp.set_start_method(mp_start_method)
 
     # disable opencv multithreading to avoid system being overloaded
     opencv_num_threads = cfg.get('opencv_num_threads', 0)
@@ -175,7 +170,8 @@ def main():
         rank = 0
     else:
         distributed = True
-        init_dist(args.launcher, **cfg.dist_params)
+        if args.launcher != 'flyte':  # flyte launcher already sets up the distributed environment
+            init_dist(args.launcher, **cfg.dist_params)
         rank, world_size = get_dist_info()
         cfg.gpu_ids = range(world_size)
 
@@ -226,28 +222,37 @@ def main():
 
     # The specific datalaoder settings
     _evaluation = []
+    eval_dataloaders = dict()
     for eval_cfg_ in cfg.evaluation:
         if args.data is not None:
             if eval_cfg_.data not in args.data:
                 continue
-        test_dataset = build_dataset(cfg.data[eval_cfg_.data])
-        test_loader_cfg = {
-            **loader_cfg,
-            **cfg.data.get('test_dataloader', {})
-        }
-        test_data_loader = build_dataloader(test_dataset, **test_loader_cfg)
+        if eval_cfg_.data in eval_dataloaders:
+            test_data_loader = eval_dataloaders[eval_cfg_.data]
+        else:
+            test_dataset = build_dataset(cfg.data[eval_cfg_.data])
+            test_loader_cfg = {
+                **loader_cfg,
+                **cfg.data.get('test_dataloader', dict())
+            }
+            test_data_loader = build_dataloader(test_dataset, **test_loader_cfg)
+            eval_dataloaders[eval_cfg_.data] = test_data_loader
         eval_cfg = deepcopy(eval_cfg_)
         eval_cfg.update(dataloader=test_data_loader)
         _evaluation.append(eval_cfg)
     cfg.evaluation = _evaluation
 
     # warm up dataloader workers
-    for data_loader in [eval_cfg.dataloader for eval_cfg in cfg.evaluation]:
+    for data_loader in unique_dataloaders(
+            [eval_cfg.dataloader for eval_cfg in cfg.evaluation]):
         if (getattr(data_loader, 'num_workers', 0) > 0
                 and getattr(data_loader, 'persistent_workers', False)):
             _ = iter(data_loader)  # spawns workers early, no data consumed
 
     # build the model and load checkpoint
+    if distributed:
+        prepare_module_wrapper(cfg)
+
     model = build_model(
         cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
     model.requires_grad_(False).eval()
@@ -276,8 +281,17 @@ def main():
             file_client = FileClient.infer_client(uri=viz_dir)
             html_path = file_client.join_path(
                 os.path.dirname(viz_dir), os.path.basename(viz_dir) + '.html')
-            if args.skip_existing and file_client.exists(html_path):
-                continue
+            if args.skip_existing:
+                # Keep distributed ranks on the same eval/skip branch.
+                skip_existing = file_client.exists(html_path) if rank == 0 else False
+                if distributed:
+                    skip_existing_list = [skip_existing]
+                    torch.distributed.broadcast_object_list(skip_existing_list, src=0)
+                    skip_existing = skip_existing_list[0]
+                if skip_existing:
+                    if rank == 0:
+                        logger.info(f'Skip existing evaluation: {html_path}')
+                    continue
 
         metrics = eval_cfg['metrics']
         if isinstance(metrics, dict):
@@ -285,13 +299,6 @@ def main():
         metrics = [build_metric(metric) for metric in metrics]
         for metric in metrics:
             metric.prepare()
-
-        # check metrics for dist evaluation
-        if distributed and metrics:
-            for metric in metrics:
-                assert metric.name in _distributed_metrics, (
-                    f'We only support {_distributed_metrics} for multi gpu '
-                    f'evaluation, but receive {metric.name}.')
 
         if args.seed is not None:
             logger.info(f'Set random seed to {args.seed}, '
@@ -319,10 +326,10 @@ def main():
                     metric.summary()
                 for name, val in metric._result_dict.items():
                     prefix_name = prefix + '_' + name if len(prefix) > 0 else name
-                    mmcv.print_log(f'{eval_cfg.data}_{prefix_name} = {val}', 'mmgen')
+                    mmcv.print_log(f'{eval_cfg.data}_{prefix_name} = {val}', 'lakonlab')
             for name, val in log_vars.items():
                 prefix_name = prefix + '_' + name if len(prefix) > 0 else name
-                mmcv.print_log(f'{eval_cfg.data}_{prefix_name} = {val}', 'mmgen')
+                mmcv.print_log(f'{eval_cfg.data}_{prefix_name} = {val}', 'lakonlab')
 
     return
 

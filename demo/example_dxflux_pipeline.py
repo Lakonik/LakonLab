@@ -9,7 +9,7 @@ pipe = PiFluxPipeline.from_pretrained(
         segment_size=1 / 3.5,  # 1 / (nfe - 1 + final_step_size_scale)
         shift=3.2),
     torch_dtype=torch.bfloat16)
-adapter_name = pipe.load_piflow_adapter(  # you may later call `pipe.set_adapters([adapter_name, ...])` to combine other adapters (e.g., style LoRAs)
+adapter_name = pipe.load_lakonlab_adapter(  # you may later call `pipe.set_adapters([adapter_name, ...])` to combine other adapters (e.g., style LoRAs)
     'Lakonik/pi-FLUX.1',
     subfolder='dxflux_n10_piid_4step',
     target_module_name='transformer')

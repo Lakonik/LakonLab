@@ -1,13 +1,55 @@
+import platform
+import random
 import warnings
 from functools import partial
 
-from mmcv.parallel import collate
-from mmcv.runner import get_dist_info
-from mmcv.utils import TORCH_VERSION, digit_version
+import numpy as np
+import torch
 from torch.utils.data import DataLoader
 
-from mmgen.datasets.builder import worker_init_fn
+from mmcv.parallel import collate
+from mmcv.runner import get_dist_info
+from mmcv.utils import TORCH_VERSION, Registry, build_from_cfg, digit_version
+
 from .samplers import DistributedSampler
+
+if platform.system() != 'Windows':
+    # https://github.com/pytorch/pytorch/issues/973
+    import resource
+    rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    base_soft_limit = rlimit[0]
+    hard_limit = rlimit[1]
+    soft_limit = min(max(4096, base_soft_limit), hard_limit)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+
+DATASETS = Registry('dataset')
+
+
+def unique_dataloaders(data_loaders):
+    """Yield dataloader objects once while preserving order."""
+    seen = set()
+    for data_loader in data_loaders:
+        key = id(data_loader)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield data_loader
+
+
+def build_dataset(cfg, default_args=None):
+    """Build dataset.
+
+    Args:
+        cfg (dict): Config for the dataset.
+        default_args (dict | None, optional): Default arguments.
+            Defaults to None.
+
+    Returns:
+        Object: Dataset for sampling data batch.
+    """
+    dataset = build_from_cfg(cfg, DATASETS, default_args)
+
+    return dataset
 
 
 def build_dataloader(dataset,
@@ -59,3 +101,12 @@ def build_dataloader(dataset,
         **kwargs)
 
     return data_loader
+
+
+def worker_init_fn(worker_id, num_workers, rank, seed):
+    # The seed of each worker equals to
+    # num_worker * rank + worker_id + user_seed
+    worker_seed = num_workers * rank + worker_id + seed
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)

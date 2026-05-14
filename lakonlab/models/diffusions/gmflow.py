@@ -1,17 +1,17 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import sys
 import inspect
+from typing import Optional
+from copy import deepcopy
+
 import torch
 import diffusers
 import mmcv
 
-from typing import Optional
-from copy import deepcopy
-from mmgen.models.architectures.common import get_module_device
-from mmgen.models.builder import MODULES, build_module
-
+from ..builder import MODULES, build_module
 from . import GaussianFlow, schedulers
+from lakonlab.models.architectures.utils import get_module_device
 from lakonlab.ops.gmflow_ops.gmflow_ops import (
     gm_to_sample, gm_to_mean, gaussian_samples_to_gm_samples, gm_samples_to_gaussian_samples,
     iso_gaussian_mul_iso_gaussian, gm_mul_iso_gaussian, gm_to_iso_gaussian, gm_transpose_t_first)
@@ -20,17 +20,17 @@ from lakonlab.ops.gmflow_ops.gmflow_ops import (
 @torch.jit.script
 def probabilistic_guidance_jit(
         cond_mean, total_var, uncond_mean, guidance_scale,
-        orthogonal: float = 1.0, orthogonal_axis: Optional[torch.Tensor] = None):
+        orthogonal: float = 1.0, parallel_dir: Optional[torch.Tensor] = None):
     dim = list(range(1, cond_mean.dim()))
     bias = cond_mean - uncond_mean
     if orthogonal > 0.0:
-        if orthogonal_axis is None:
-            orthogonal_axis = cond_mean
-        bias = bias - ((bias * orthogonal_axis).mean(
+        if parallel_dir is None:
+            parallel_dir = cond_mean
+        bias = bias - ((bias * parallel_dir).mean(
             dim=dim, keepdim=True
-        ) / (orthogonal_axis * orthogonal_axis).mean(
+        ) / (parallel_dir * parallel_dir).mean(
             dim=dim, keepdim=True
-        ).clamp(min=1e-6) * orthogonal_axis).mul(orthogonal)
+        ).clamp(min=1e-6) * parallel_dir).mul(orthogonal)
     bias_power = (bias * bias).mean(dim=dim, keepdim=True)
     avg_var = total_var.mean(dim=dim, keepdim=True)
     bias = bias * ((avg_var / bias_power.clamp(min=1e-6)).sqrt() * guidance_scale)
@@ -340,6 +340,7 @@ class GMFlow(GMFlowMixin, GaussianFlow):
             spectral_loss_weight=1.0,
             **kwargs):
         super().__init__(*args, **kwargs)
+        assert self.denoising_mean_mode.upper() == 'U'
         self.spectrum_net = build_module(spectrum_net) if spectrum_net is not None else None
         self.spectral_loss_weight = spectral_loss_weight
         self.intermediate_x_t = []
@@ -382,7 +383,7 @@ class GMFlow(GMFlowMixin, GaussianFlow):
         loss = loss.mean() * (0.5 * self.spectral_loss_weight)
         return loss
 
-    def pred(self, x_t=None, t=None, **kwargs):
+    def pred(self, x_t=None, t=None, test_cfg=dict(), **kwargs):
         ndim = x_t.dim()
         assert ndim in [4, 5], f'Invalid x_t shape: {x_t.shape}. Expected 4D or 5D tensor.'
         if ndim == 5:  # (bs, t, c, h, w)
@@ -404,9 +405,15 @@ class GMFlow(GMFlowMixin, GaussianFlow):
 
         trans_ratio = self.train_cfg.get('trans_ratio', 1.0)
         eps = self.train_cfg.get('eps', 1e-4)
+        max_raw_t = self.train_cfg.get('max_raw_t', 1.0)
+        min_raw_t = self.train_cfg.get('min_raw_t', 0.0)
 
         t_high = self.timestep_sampler(
-            num_batches, seq_len=seq_len).to(device).clamp(min=eps, max=self.num_timesteps)
+            num_batches,
+            seq_len=seq_len,
+            device=device,
+            raw_t_range=(min_raw_t, max_raw_t)
+        ).clamp(min=eps, max=self.num_timesteps)
         t_low = t_high * (1 - trans_ratio)
         t_low = torch.minimum(t_low, t_high - eps).clamp(min=0)
 
@@ -460,6 +467,9 @@ class GMFlow(GMFlowMixin, GaussianFlow):
         for key in ['shift', 'use_dynamic_shifting', 'base_seq_len', 'max_seq_len', 'base_logshift', 'max_logshift']:
             if key in signatures and key not in sampler_kwargs:
                 sampler_kwargs[key] = cfg.get(key, getattr(self.timestep_sampler, key))
+        for key in ['max_raw_t', 'min_raw_t']:
+            if key in signatures and key in cfg and key not in sampler_kwargs:
+                sampler_kwargs[key] = cfg[key]
         sampler = sampler_class(self.num_timesteps, **sampler_kwargs)
 
         num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
@@ -490,6 +500,8 @@ class GMFlow(GMFlowMixin, GaussianFlow):
                 [guidance_scale]
             ).expand(num_batches).reshape([num_batches] + [1] * (x_t.dim() - 1))
 
+        x_t = timesteps[0] / self.num_timesteps * x_t
+
         if show_pbar:
             pbar = mmcv.ProgressBar(num_timesteps)
 
@@ -508,7 +520,7 @@ class GMFlow(GMFlowMixin, GaussianFlow):
             if use_guidance:
                 x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
 
-            gm_output = self.pred(x_t_input, t, **_kwargs)
+            gm_output = self.pred(x_t_input, t, test_cfg=cfg, **_kwargs)
             assert isinstance(gm_output, dict)
             gm_output = self.u_to_x_0(gm_output, x_t_input, t)
 
@@ -631,7 +643,7 @@ class GMFlow(GMFlowMixin, GaussianFlow):
             gaussian_output = probabilistic_guidance_jit(
                 gaussian_cond['mean'], gaussian_cond['var'], uncond_mean, guidance_scale,
                 orthogonal=orthogonal_guidance,
-                orthogonal_axis=self.u_to_x_0(gaussian_cond['mean'], x_t, t))[0]
+                parallel_dir=self.u_to_x_0(gaussian_cond['mean'], x_t, t))[0]
             gm_output = gm_mul_iso_gaussian(
                 gm_cond, iso_gaussian_mul_iso_gaussian(gaussian_output, gaussian_cond, 1, -1),
                 1, 1)[0]

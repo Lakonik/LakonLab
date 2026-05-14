@@ -1,20 +1,20 @@
-numpy==1.26.4
-mmcv @ git+https://github.com/open-mmlab/mmcv.git@d409eedc816fccfb1c8d57e5eed5f03bd075f327
-mmgen @ git+https://github.com/Lakonik/mmgeneration.git@500a93e474638c87dcaf8fad94cfbe1ef29acd1f
+mmcv==1.6.1
 transformers==4.57.3
-diffusers==0.36.0
+diffusers==0.37.0
 peft==0.17.0
 sentencepiece
 accelerate
 tensorboard
-setuptools
+setuptools<74
 bitsandbytes>=0.46.1
 yapf==0.40.1
 zstandard
 imageio-ffmpeg
 imageio
+beautifulsoup4
 wandb
 open_clip_torch
 gradio==5.49.0
 datasets
 boto3
+lpips

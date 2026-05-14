@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -8,8 +8,8 @@ from diffusers.models import AutoencoderKL
 from diffusers.pipelines import DiTPipeline
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import ImagePipelineOutput
-from lakonlab.models.architecture.gmflow.gmdit import _GMDiTTransformer2DModel as GMDiTTransformer2DModel
-from lakonlab.models.architecture.gmflow.spectrum_mlp import _SpectrumMLP as SpectrumMLP
+from lakonlab.models.architectures.gmflow.gmdit import _GMDiTTransformer2DModel as GMDiTTransformer2DModel
+from lakonlab.models.architectures.gmflow.spectrum_mlp import _SpectrumMLP as SpectrumMLP
 from lakonlab.models.diffusions.schedulers import FlowSDEScheduler, FlowEulerODEScheduler
 from lakonlab.models.diffusions.gmflow import probabilistic_guidance_jit, GMFlowMixin
 from lakonlab.ops.gmflow_ops.gmflow_ops import (

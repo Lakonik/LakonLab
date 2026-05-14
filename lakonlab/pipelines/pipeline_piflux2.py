@@ -1,16 +1,18 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
+
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from functools import partial
 
 import PIL
 import torch
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from functools import partial
+
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
 from diffusers.utils import is_torch_xla_available
 from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
 from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline, Flux2PipelineOutput
 from lakonlab.models.diffusions.schedulers.flow_map_sde import FlowMapSDEScheduler
 from lakonlab.models.diffusions.piflow_policies import POLICY_CLASSES
-from .piflow_utils import PiFlowMixin
+from .utils import LakonLabMixin
 
 
 if is_torch_xla_available():
@@ -21,7 +23,7 @@ else:
     XLA_AVAILABLE = False
 
 
-class PiFlux2Pipeline(Flux2Pipeline, PiFlowMixin):
+class PiFlux2Pipeline(Flux2Pipeline, LakonLabMixin):
     r"""
     The policy-based Flux2 pipeline for text-to-image generation.
 
@@ -344,9 +346,13 @@ class PiFlux2Pipeline(Flux2Pipeline, PiFlowMixin):
                 else:
                     raise ValueError(f'Unknown policy type: {self.policy_type}.')
 
-                latents_dst = self.policy_rollout(
-                    latents, sigma_t_src, sigma_t_dst, total_substeps,
-                    policy, seq_len=image_seq_len)
+                raw_t_src = self.scheduler.unwarp_t(
+                    sigma_t_src, seq_len=image_seq_len)
+                raw_t_dst = self.scheduler.unwarp_t(
+                    sigma_t_dst, seq_len=image_seq_len)
+                latents_dst, _, _ = policy.integrate(
+                    latents, sigma_t_src, raw_t_src, raw_t_dst, self.scheduler,
+                    seq_len=image_seq_len, total_substeps=total_substeps)
 
                 latents = self.scheduler.step(latents_dst, t_src, latents, return_dict=False)[0]
 

@@ -9,25 +9,24 @@ warnings.filterwarnings(
 )
 
 import os
+import itertools
+import argparse
+import multiprocessing as mp
+from io import BytesIO
+
 import torch
+import torch.distributed as dist
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-import itertools
-import argparse
-import multiprocessing as mp
-import torch
-import torch.distributed as dist
 import mmcv
-
-from io import BytesIO
 from mmcv.runner import get_dist_info, init_dist
 from mmcv.fileio import FileClient
-from mmgen.apis import set_random_seed
 
 from lakonlab.datasets import ImageNet, build_dataloader
 from lakonlab.models import PretrainedVAEEncoder
+from lakonlab.runner.utils import set_random_seed
 
 
 if __name__ == '__main__':
@@ -47,7 +46,10 @@ if __name__ == '__main__':
         help='whether to set deterministic options for CUDNN backend.')
     args = parser.parse_args()
 
-    mp.set_start_method('fork')
+    try:
+        mp.set_start_method('fork')
+    except RuntimeError:
+        pass
 
     init_dist('pytorch')
     rank, ws = get_dist_info()

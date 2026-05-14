@@ -5,7 +5,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 import gradio as gr
-from mmgen.apis import set_random_seed
+from mmcv.runner import set_random_seed
 from lakonlab.models.diffusions.schedulers.flow_map_sde import FlowMapSDEScheduler
 from lakonlab.ui.gradio.create_img_edit import create_interface_img_edit
 from lakonlab.pipelines.pipeline_piflux2 import PiFlux2Pipeline
@@ -40,7 +40,7 @@ def main():
     pipe = PiFlux2Pipeline.from_pretrained(
         'diffusers/FLUX.2-dev-bnb-4bit',
         torch_dtype=torch.bfloat16)
-    pipe.load_piflow_adapter(
+    pipe.load_lakonlab_adapter(
         'Lakonik/pi-FLUX.2',
         subfolder='gmflux2_k8_piid_4step',
         target_module_name='transformer')

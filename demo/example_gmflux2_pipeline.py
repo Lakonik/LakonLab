@@ -6,7 +6,7 @@ from diffusers.utils import load_image
 pipe = PiFlux2Pipeline.from_pretrained(
     'diffusers/FLUX.2-dev-bnb-4bit',
     torch_dtype=torch.bfloat16)
-adapter_name = pipe.load_piflow_adapter(  # you may later call `pipe.set_adapters([adapter_name, ...])` to combine other adapters (e.g., style LoRAs)
+adapter_name = pipe.load_lakonlab_adapter(  # you may later call `pipe.set_adapters([adapter_name, ...])` to combine other adapters (e.g., style LoRAs)
     'Lakonik/pi-FLUX.2',
     subfolder='gmflux2_k8_piid_4step',
     target_module_name='transformer')

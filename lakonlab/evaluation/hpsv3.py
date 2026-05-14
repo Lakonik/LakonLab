@@ -21,9 +21,9 @@ from transformers.image_utils import (
 from transformers.utils import TensorType
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLVisionBlock, Qwen2VLDecoderLayer
 from mmcv.runner import get_dist_info
-from mmgen.core.registry import METRICS
-from mmgen.core.evaluation.metrics import Metric
 from lakonlab.runner.checkpoint import _load_checkpoint
+from .builder import METRICS
+from .metrics import Metric
 
 
 INSTRUCTION = """
@@ -524,7 +524,7 @@ class HPSv3(Metric):
             ws = dist.get_world_size()
             placeholder = [torch.empty_like(rewards) for _ in range(ws)]
             dist.all_gather(placeholder, rewards)
-            rewards = torch.cat(placeholder, dim=0)
+            rewards = torch.stack(placeholder, dim=1).reshape(rewards.size(0) * ws)
 
         if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
             self.scores.append(rewards.float().cpu())

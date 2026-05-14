@@ -1,9 +1,9 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import torch
 
 from torch.utils.data import Dataset
-from mmgen.datasets.builder import DATASETS
+from .builder import DATASETS
 
 
 @DATASETS.register_module()

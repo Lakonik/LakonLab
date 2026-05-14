@@ -1,8 +1,10 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
+import contextlib
 from abc import ABCMeta, abstractmethod
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.distributed.fsdp import FullyShardedDataParallel
 try:
     from torch.distributed.fsdp import FSDPModule
@@ -67,6 +69,26 @@ def guess_bs(data):
     return None
 
 
+@contextlib.contextmanager
+def maybe_ddp_no_sync(modules, enabled=True):
+    if not enabled:
+        yield
+        return
+
+    seen = set()
+    with contextlib.ExitStack() as stack:
+        for module in modules:
+            if module is None:
+                continue
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            if isinstance(module, DistributedDataParallel):
+                stack.enter_context(module.no_sync())
+        yield
+
+
 class BaseModel(nn.Module, metaclass=ABCMeta):
     """Base class for all models in the training framework. Optionally supports:
     - Gradient accumulation
@@ -80,6 +102,8 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
             grad_clip_begin_iter = self.train_cfg.get(k + '_grad_clip_begin_iter', 0)
             grad_clip_skip_ratio = self.train_cfg.get(k + '_grad_clip_skip_ratio', 0.0)
             skip_step = False
+            if loss_scaler is not None:
+                loss_scaler.unscale_(v)
             if grad_clip > 0.0 and running_status['iteration'] >= grad_clip_begin_iter:
                 m = getattr(self, k)
                 if isinstance(m, FullyShardedDataParallel):  # FSDP1
@@ -98,7 +122,6 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
                 if loss_scaler is None:
                     v.step()
                 else:
-                    loss_scaler.unscale_(v)
                     loss_scaler.step(v)
         return log_vars
 
@@ -110,11 +133,14 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
     def train_grad_accum(
             self, train_minibatch_func, data_splits, optimizer, grad_accum_steps, loss_scaler=None, running_status=None):
         log_vars = dict()
+        optimizer_modules = [getattr(self, k, None) for k in optimizer.keys()]
 
         bs = 0
         for grad_step_id in range(grad_accum_steps):
-            log_vars_single, bs_single = train_minibatch_func(
-                data_splits[grad_step_id], loss_scaler, running_status)
+            with maybe_ddp_no_sync(
+                    optimizer_modules, enabled=(grad_step_id < grad_accum_steps - 1)):
+                log_vars_single, bs_single = train_minibatch_func(
+                    data_splits[grad_step_id], loss_scaler, running_status)
             for k, v in log_vars_single.items():
                 if k in log_vars:
                     log_vars[k] += float(v)

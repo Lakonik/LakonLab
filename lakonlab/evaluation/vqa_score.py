@@ -19,9 +19,9 @@ from transformers import (
 from transformers.models.t5.modeling_t5 import T5Block
 from transformers.modeling_outputs import Seq2SeqLMOutput
 from mmcv.runner import get_dist_info
-from mmgen.core.registry import METRICS
-from mmgen.core.evaluation.metrics import Metric
 from lakonlab.runner.checkpoint import load_checkpoint
+from .metrics import Metric
+from .builder import METRICS
 
 
 IMAGE_TOKEN_INDEX = -200

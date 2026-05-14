@@ -1,13 +1,13 @@
-# Copyright (c) 2025 Hansheng Chen
-
-import torch
+# Copyright (c) 2026 Hansheng Chen
 
 from abc import abstractmethod
 from copy import deepcopy
-from accelerate import init_empty_weights
-from mmgen.models.builder import build_module
 
-from .base import BaseModel
+import torch
+from accelerate import init_empty_weights
+
+from .builder import build_module
+from .base import BaseModel, maybe_ddp_no_sync
 from lakonlab.utils import clone_params, rgetattr, tie_untrained_submodules, untie_all_parameters
 
 
@@ -23,7 +23,8 @@ def train_fwd_bwd(model, args, kwargs, loss_scaler=None):
             step_loss, step_log_vars, step_states = model(
                 *args, return_loss=True, step_states=step_states, **kwargs)
             if step_states['detachable']:
-                step_loss.backward() if loss_scaler is None else loss_scaler.scale(step_loss).backward()
+                with maybe_ddp_no_sync([model], enabled=not step_states['terminate']):
+                    step_loss.backward() if loss_scaler is None else loss_scaler.scale(step_loss).backward()
                 step_loss.detach_()
             loss = loss + step_loss
             for k, v in step_log_vars.items():
@@ -68,6 +69,7 @@ class BaseDiffusion(BaseModel):
         else:
             self.teacher = None
 
+        diffusion = deepcopy(diffusion)
         diffusion.update(train_cfg=train_cfg, test_cfg=test_cfg)
         self.diffusion = build_module(diffusion)
         if self.teacher is not None:
@@ -180,6 +182,29 @@ class BaseDiffusion(BaseModel):
         bs, diffusion_args, diffusion_kwargs = self._prepare_train_minibatch_args(data, running_status)
         log_vars = train_fwd_bwd(self.diffusion, diffusion_args, diffusion_kwargs, loss_scaler)
         return log_vars, bs
+
+    def _get_clamp_denoised_callback(self):
+        assert self.vae is not None, 'VAE must be provided for clamp_denoised sampling.'
+
+        def clamp_denoised_callback(diffusion, callback_kwargs):
+            x_t = callback_kwargs['x_t']
+            denoising_output = callback_kwargs['denoising_output']
+            t = callback_kwargs['t']
+
+            denoised = diffusion.u_to_x_0(denoising_output, x_t, t=t)
+            denoised = self.unpatchify(denoised)
+            if hasattr(self.vae, 'dtype'):
+                vae_dtype = self.vae.dtype
+            else:
+                vae_dtype = next(self.vae.parameters()).dtype
+            image = self.vae.decode(denoised.to(vae_dtype)).clamp(-1, 1)
+            denoised = self.vae.encode(image)
+            denoised = self.patchify(denoised).to(device=x_t.device, dtype=x_t.dtype)
+
+            denoising_output = diffusion.x_0_to_u(denoised, x_t, t=t)
+            return dict(denoising_output=denoising_output)
+
+        return clamp_denoised_callback
 
     @abstractmethod
     def val_step(self, data, test_cfg_override=dict(), **kwargs):

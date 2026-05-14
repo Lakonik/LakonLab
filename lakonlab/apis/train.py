@@ -1,14 +1,22 @@
 # Modified from https://github.com/open-mmlab/mmgeneration
 
+import hashlib
+
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import HOOKS, IterBasedRunner, OptimizerHook, build_runner
 from mmcv.utils import build_from_cfg
 
-from mmgen.utils import get_root_logger
-
+from lakonlab.utils import get_root_logger
 from lakonlab.parallel import apply_module_wrapper
 from lakonlab.runner.optimizer import build_optimizers
 from lakonlab.runner.checkpoint import exists_ckpt
+from lakonlab.runner.utils import set_random_seed
+
+
+def _make_resume_seed(seed, iteration):
+    payload = f'{seed}:{iteration}'.encode('utf-8')
+    return int.from_bytes(
+        hashlib.blake2s(payload, digest_size=4).digest(), 'little')
 
 
 def train_model(model,
@@ -112,6 +120,17 @@ def train_model(model,
         ckpt_kwargs.update(map_location='cpu')
     if exists_ckpt(cfg.resume_from):
         runner.resume(cfg.resume_from, **ckpt_kwargs)
+        if cfg.get('seed', None) is not None:
+            resume_seed = _make_resume_seed(cfg.seed, runner.iter)
+            logger.info(
+                f'Set resume random seed to {resume_seed} '
+                f'(base seed: {cfg.seed}, iter: {runner.iter}), '
+                f'deterministic: {cfg.get("deterministic", False)}, '
+                f'use_rank_shift: {cfg.get("diff_seed", False)}')
+            set_random_seed(
+                resume_seed,
+                deterministic=cfg.get('deterministic', False),
+                use_rank_shift=cfg.get('diff_seed', False))
         for data_loader in data_loaders:
             data_loader.sampler.set_epoch(runner.epoch)
             data_loader.sampler.set_iter(runner.iter)

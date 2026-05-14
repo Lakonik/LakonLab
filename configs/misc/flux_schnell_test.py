@@ -50,7 +50,7 @@ data = dict(
 
 evaluation = []
 for data_split in ['test', 'test2']:
-    prefix = f'step4'
+    prefix = 'step4'
     num_images = None
     metrics = []
     if data_split == 'test':

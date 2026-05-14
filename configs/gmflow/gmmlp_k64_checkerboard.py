@@ -74,7 +74,7 @@ log_config = dict(
 
 custom_hooks = [
     dict(
-        type='ExponentialMovingAverageHookMod',
+        type='ExponentialMovingAverageHook',
         module_keys=('diffusion_ema', ),
         interp_mode='lerp',
         interval=1,
@@ -86,7 +86,7 @@ custom_hooks = [
 
 # use dynamic runner
 runner = dict(
-    type='DynamicIterBasedRunnerMod',
+    type='DynamicIterBasedRunner',
     pass_training_status=True,
     ckpt_trainable_only=True,
     ckpt_fp16_ema=True,

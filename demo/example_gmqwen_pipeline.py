@@ -5,7 +5,7 @@ from lakonlab.pipelines.pipeline_piqwen import PiQwenImagePipeline
 pipe = PiQwenImagePipeline.from_pretrained(
     'Qwen/Qwen-Image',
     torch_dtype=torch.bfloat16)
-adapter_name = pipe.load_piflow_adapter(  # you may later call `pipe.set_adapters([adapter_name, ...])` to combine other adapters (e.g., style LoRAs)
+adapter_name = pipe.load_lakonlab_adapter(  # you may later call `pipe.set_adapters([adapter_name, ...])` to combine other adapters (e.g., style LoRAs)
     'Lakonik/pi-Qwen-Image',
     subfolder='gmqwen_k8_piid_4step',
     target_module_name='transformer')

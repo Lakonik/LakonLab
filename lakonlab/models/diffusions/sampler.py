@@ -1,9 +1,9 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import numpy as np
 import torch
 
-from mmgen.models.builder import MODULES
+from ..builder import MODULES
 
 
 @MODULES.register_module()
@@ -54,7 +54,8 @@ class ContinuousTimeStepSampler:
     def sample(self, batch_size, warp_t=True, scale_t=True, seq_len=None,
                raw_t_range=None, device=None):
         if self.logit_normal_enable:
-            assert raw_t_range is None
+            if raw_t_range is not None:
+                assert raw_t_range[0] == 0.0 and raw_t_range[1] == 1.0
             t = torch.sigmoid(
                 self.logit_normal_mean + self.logit_normal_std * torch.randn(
                     (batch_size, ), dtype=torch.float, device=device))

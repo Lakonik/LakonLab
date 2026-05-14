@@ -1,10 +1,10 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import numpy as np
 import torch
 
 from torch.utils.data import DistributedSampler as _DistributedSampler
-from mmgen.utils import sync_random_seed
+from lakonlab.runner import sync_random_seed
 
 
 def reverse_index_map(bucket_ids):

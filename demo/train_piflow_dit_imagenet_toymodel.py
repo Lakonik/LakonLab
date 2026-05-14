@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import os
 import argparse
@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from lakonlab.models.diffusions.piflow_policies import GMFlowPolicy
-from lakonlab.models.architecture import (
+from lakonlab.models.architectures import (
     DiTTransformer2DModelMod, PretrainedVAE)
 from lakonlab.models import GaussianFlow
 

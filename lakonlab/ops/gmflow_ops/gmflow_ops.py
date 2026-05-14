@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 # A complete library for Gaussian mixture operations in PyTorch.
 # Some of the functions are not used in GMFlow but are kept for future reference.

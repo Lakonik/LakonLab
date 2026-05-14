@@ -1,10 +1,11 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
+
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union, List
 
 import numpy as np
 import torch
 
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.utils import BaseOutput, logging
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
@@ -26,13 +27,17 @@ class FlowEulerODEScheduler(SchedulerMixin, ConfigMixin):
     def __init__(
             self,
             num_train_timesteps: int = 1000,
+            use_fp64: bool = False,
             shift: float = 1.0,
             use_dynamic_shifting=False,
+            dynamic_shifting_type='exp',
             base_seq_len=256,
             max_seq_len=4096,
             base_logshift=0.5,
             max_logshift=1.15,
-            terminal_sigma=None):
+            terminal_sigma=None,
+            max_raw_t=1.0,
+            min_raw_t=0.0):
         sigmas = torch.from_numpy(1 - np.linspace(
             0, 1, num_train_timesteps, dtype=np.float32, endpoint=False))
         self.sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
@@ -40,9 +45,6 @@ class FlowEulerODEScheduler(SchedulerMixin, ConfigMixin):
 
         self._step_index = None
         self._begin_index = None
-
-        self.sigma_min = self.sigmas[-1].item()
-        self.sigma_max = self.sigmas[0].item()
 
     @property
     def step_index(self):
@@ -57,13 +59,23 @@ class FlowEulerODEScheduler(SchedulerMixin, ConfigMixin):
 
     def get_shift(self, seq_len=None):
         if self.config.use_dynamic_shifting and seq_len is not None:
-            m = (self.config.max_logshift - self.config.base_logshift
-                 ) / (self.config.max_seq_len - self.config.base_seq_len)
-            logshift = (seq_len - self.config.base_seq_len) * m + self.config.base_logshift
-            if isinstance(logshift, torch.Tensor):
-                shift = torch.exp(logshift)
+            if self.config.dynamic_shifting_type == 'exp':
+                m = (self.config.max_logshift - self.config.base_logshift
+                     ) / (self.config.max_seq_len - self.config.base_seq_len)
+                logshift = (seq_len - self.config.base_seq_len) * m + self.config.base_logshift
+                if isinstance(logshift, torch.Tensor):
+                    shift = torch.exp(logshift)
+                else:
+                    shift = np.exp(logshift)
+            elif self.config.dynamic_shifting_type == 'sqrt':
+                max_shift = np.exp(self.config.max_logshift)
+                base_shift = np.exp(self.config.base_logshift)
+                sqrt_max_seq_len = np.sqrt(self.config.max_seq_len)
+                sqrt_base_seq_len = np.sqrt(self.config.base_seq_len)
+                m = (max_shift - base_shift) / (sqrt_max_seq_len - sqrt_base_seq_len)
+                shift = (np.sqrt(seq_len) - sqrt_base_seq_len) * m + base_shift
             else:
-                shift = np.exp(logshift)
+                raise ValueError(f'Unsupported dynamic_shifting_type [{self.config.dynamic_shifting_type}].')
         else:
             shift = self.config.shift
         return shift
@@ -73,11 +85,25 @@ class FlowEulerODEScheduler(SchedulerMixin, ConfigMixin):
         stretched_sigma = 1 - (one_minus_sigma * (1 - self.config.terminal_sigma) / one_minus_sigma[-1])
         return stretched_sigma
 
-    def set_timesteps(self, num_inference_steps: int, seq_len=None, device=None):
-        self.num_inference_steps = num_inference_steps
+    def set_timesteps(
+            self,
+            num_inference_steps: Optional[int] = None,
+            sigmas: Optional[List[float]] = None,
+            seq_len=None,
+            device=None):
+        if sigmas is None:
+            assert num_inference_steps is not None, 'Either num_inference_steps or sigmas must be provided.'
+            self.num_inference_steps = num_inference_steps
+            sigmas = np.linspace(
+                self.config.max_raw_t, self.config.min_raw_t,
+                num_inference_steps, dtype=np.float32, endpoint=False)
+        else:
+            if num_inference_steps is not None:
+                assert len(sigmas) == num_inference_steps
+            self.num_inference_steps = len(sigmas)
+            sigmas = np.array(sigmas, dtype=np.float32)
 
-        sigmas = torch.from_numpy(np.linspace(
-            1, 0, num_inference_steps, dtype=np.float32, endpoint=False))
+        sigmas = torch.from_numpy(sigmas)
         shift = self.get_shift(seq_len=seq_len)
         sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
 
@@ -133,13 +159,13 @@ class FlowEulerODEScheduler(SchedulerMixin, ConfigMixin):
         if self.step_index is None:
             self._init_step_index(timestep)
 
-        # Upcast to avoid precision issues when computing prev_sample
         ori_dtype = model_output.dtype
-        sample = sample.to(torch.float32)
-        model_output = model_output.to(torch.float32)
+        solver_dtype = torch.float64 if self.config.use_fp64 else torch.float32
+        sample = sample.to(solver_dtype)
+        model_output = model_output.to(solver_dtype)
 
-        sigma = self.sigmas[self.step_index]
-        sigma_to = self.sigmas[self.step_index + 1]
+        sigma = self.sigmas[self.step_index].to(solver_dtype)
+        sigma_to = self.sigmas[self.step_index + 1].to(solver_dtype)
 
         if prediction_type == 'u':
             derivative = model_output

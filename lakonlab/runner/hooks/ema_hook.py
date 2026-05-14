@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import mmcv
 import torch
@@ -9,8 +9,7 @@ try:
 except:
     FSDPModule = None
 from mmcv.parallel import is_module_wrapper
-from mmcv.runner import HOOKS
-from mmgen.core import ExponentialMovingAverageHook
+from mmcv.runner import HOOKS, Hook
 from lakonlab.utils import rgetattr, rhasattr
 
 
@@ -28,9 +27,10 @@ def get_ori_key(key):
     return ori_key
 
 
-@HOOKS.register_module()
-class ExponentialMovingAverageHookMod(ExponentialMovingAverageHook):
+@HOOKS.register_module(force=True)
+class ExponentialMovingAverageHook(Hook):
 
+    _registered_interp_funcs = ['lerp']
     _registered_momentum_updaters = ['rampup', 'fixed', 'karras']
 
     def __init__(self,
@@ -42,7 +42,7 @@ class ExponentialMovingAverageHookMod(ExponentialMovingAverageHook):
                  start_iter=0,
                  momentum_policy='fixed',
                  momentum_cfg=None):
-        super(ExponentialMovingAverageHook, self).__init__()
+        super().__init__()
         self.trainable_only = trainable_only
         # check args
         assert interp_mode in self._registered_interp_funcs, (
@@ -83,10 +83,64 @@ class ExponentialMovingAverageHookMod(ExponentialMovingAverageHook):
             ), f'Currently, we do not support {self.momentum_policy} for EMA.'
             self.momentum_updater = getattr(self, momentum_policy)
 
+    @staticmethod
+    def lerp(a, b, momentum=0.999, momentum_nontrainable=0., trainable=True):
+        """Does a linear interpolation of two parameters/ buffers.
+
+        Args:
+            a (torch.Tensor): Interpolation start point, refer to orig state.
+            b (torch.Tensor): Interpolation end point, refer to ema state.
+            momentum (float, optional): The weight for the interpolation
+                formula. Defaults to 0.999.
+            momentum_nontrainable (float, optional): The weight for the
+                interpolation formula used for nontrainable parameters.
+                Defaults to 0..
+            trainable (bool, optional): Whether input parameters is trainable.
+                If set to False, momentum_nontrainable will be used.
+                Defaults to True.
+
+        Returns:
+            torch.Tensor: Interpolation result.
+        """
+        m = momentum if trainable else momentum_nontrainable
+        return a + (b - a) * m
+
+    @staticmethod
+    def rampup(runner, ema_kimg=10, ema_rampup=0.05, batch_size=4, eps=1e-8):
+        """Ramp up ema momentum.
+
+        Ref: https://github.com/NVlabs/stylegan3/blob/a5a69f58294509598714d1e88c9646c3d7c6ec94/training/training_loop.py#L300-L308 # noqa
+
+        Args:
+            runner (_type_): _description_
+            ema_kimg (int, optional): Half-life of the exponential moving
+                average of generator weights. Defaults to 10.
+            ema_rampup (float, optional): EMA ramp-up coefficient.If set to
+                None, then rampup will be disabled. Defaults to 0.05.
+            batch_size (int, optional): Total batch size for one training
+                iteration. Defaults to 4.
+            eps (float, optional): Epsiolon to avoid ``batch_size`` divided by
+                zero. Defaults to 1e-8.
+
+        Returns:
+            dict: Updated momentum.
+        """
+        cur_nimg = (runner.iter + 1) * batch_size
+        ema_nimg = ema_kimg * 1000
+        if ema_rampup is not None:
+            ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
+        ema_beta = 0.5**(batch_size / max(ema_nimg, eps))
+        return dict(momentum=ema_beta)
+
     def karras(self, runner, gamma=7.0, max_momentum=1.0):
         t = max(runner.iter + 1 - self.start_iter, 1)
         ema_beta = min((1 - 1 / t) ** (gamma + 1), max_momentum)
         return dict(momentum=ema_beta)
+
+    def every_n_iters(self, runner, n):
+        if runner.iter < self.start_iter:
+            return True
+        return (runner.iter + 1 - self.start_iter) % n == 0 if n > 0 else False
 
     def after_train_iter(self, runner):
         if not self.every_n_iters(runner, self.interval):

@@ -2,7 +2,11 @@
 /work_dirs*
 .vscode/
 /tmp
-/data
+/data/*
+!/data/imagenet/imagenet1000_clsidx_to_labels.txt
+!/data/dpgbench-prompts/prompts.jsonl
+!/data/geneval-prompts/prompts.jsonl
+!/data/geneval-prompts/evaluation_metadata.jsonl
 /checkpoints
 *.so
 *.patch
@@ -22,5 +26,6 @@ build/
 /exp/
 /dev/
 *.pyi
-!/data/imagenet/imagenet1000_clsidx_to_labels.txt
+*.pem
 *.env
+.DS_Store

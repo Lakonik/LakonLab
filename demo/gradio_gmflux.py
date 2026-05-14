@@ -39,7 +39,7 @@ def main():
         tokenizer=base_pipe.tokenizer,
         tokenizer_2=base_pipe.tokenizer_2,
         scheduler=scheduler)
-    pipe_4nfe.load_piflow_adapter(
+    pipe_4nfe.load_lakonlab_adapter(
         'Lakonik/pi-FLUX.1',
         subfolder='gmflux_k8_piid_4step',
         target_module_name='transformer')
@@ -52,7 +52,7 @@ def main():
         tokenizer=base_pipe.tokenizer,
         tokenizer_2=base_pipe.tokenizer_2,
         scheduler=scheduler)
-    pipe_8nfe.load_piflow_adapter(
+    pipe_8nfe.load_lakonlab_adapter(
         'Lakonik/pi-FLUX.1',
         subfolder='gmflux_k8_piid_8step',
         target_module_name='transformer')

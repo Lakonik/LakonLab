@@ -1,8 +1,9 @@
 import os
 import argparse
-import torch
 from io import BytesIO
 from collections import OrderedDict
+
+import torch
 from mmcv.fileio import FileClient
 from lakonlab.runner.checkpoint import write_checkpoint_to_file
 

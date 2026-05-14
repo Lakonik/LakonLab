@@ -1,6 +1,5 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
-import importlib
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -12,11 +11,7 @@ except:
 from mmcv.parallel.scatter_gather import scatter_kwargs
 from mmcv.parallel import MODULE_WRAPPERS
 
-
-def get_module_object(path):
-    module_path, attribute = path.rsplit('.', 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, attribute)
+from lakonlab.utils import get_module_object
 
 
 @MODULE_WRAPPERS.register_module()
@@ -49,6 +44,8 @@ class FSDP2Wrapper(nn.Module):
         if fsdp_modules is not None:
             assert isinstance(fsdp_modules, (list, tuple))
             fsdp_modules = tuple([get_module_object(m) for m in fsdp_modules])
+        else:
+            fsdp_modules = ()
         self.to_fsdp(
             wrap_frozen_modules,
             ignore_frozen_parameters,
@@ -67,13 +64,20 @@ class FSDP2Wrapper(nn.Module):
                 module = module.cuda()
             elif all(not p.requires_grad for p in module.parameters()):
                 if wrap_frozen_modules:
+                    ignored_params = []
+                    for p in module.parameters():
+                        if getattr(p, 'lakonlab_no_shard', False):
+                            p.data = p.data.cuda()
+                            ignored_params.append(p)
                     for submodule in module.modules():
-                        if isinstance(submodule, fsdp_modules):
+                        if isinstance(submodule, fsdp_modules) and next(submodule.parameters(), None) is not None:
                             fsdp_kwargs = kwargs.copy()
                             fsdp_kwargs.update(
                                 mp_policy=MixedPrecisionPolicy(
                                     param_dtype=self.param_dtype,
                                     reduce_dtype=self.reduce_dtype))
+                            if len(ignored_params) > 0:  # requires torch >= 2.7
+                                fsdp_kwargs.update(ignored_params=ignored_params)
                             fully_shard(submodule, **fsdp_kwargs)
                     fsdp_kwargs = kwargs.copy()
                     fsdp_kwargs.update(
@@ -81,26 +85,25 @@ class FSDP2Wrapper(nn.Module):
                             param_dtype=self.param_dtype,
                             reduce_dtype=self.reduce_dtype,
                             cast_forward_inputs=False))
+                    if len(ignored_params) > 0:  # requires torch >= 2.7
+                        fsdp_kwargs.update(ignored_params=ignored_params)
                     fully_shard(module, **fsdp_kwargs)
                 else:
                     module = module.cuda()
             else:
-                if ignore_frozen_parameters:
-                    ignored_params = []
-                    for p in module.parameters():
-                        if not p.requires_grad:
-                            p.data = p.data.cuda()
-                            ignored_params.append(p)
-                else:
-                    ignored_params = None
+                ignored_params = []
+                for p in module.parameters():
+                    if getattr(p, 'lakonlab_no_shard', False) or (ignore_frozen_parameters and not p.requires_grad):
+                        p.data = p.data.cuda()
+                        ignored_params.append(p)
                 for submodule in module.modules():
-                    if isinstance(submodule, fsdp_modules):
+                    if isinstance(submodule, fsdp_modules) and next(submodule.parameters(), None) is not None:
                         fsdp_kwargs = kwargs.copy()
                         fsdp_kwargs.update(
                             mp_policy=MixedPrecisionPolicy(
                                 param_dtype=self.param_dtype,
                                 reduce_dtype=self.reduce_dtype))
-                        if ignored_params is not None:  # requires torch >= 2.7
+                        if len(ignored_params) > 0:  # requires torch >= 2.7
                             fsdp_kwargs.update(ignored_params=ignored_params)
                         fully_shard(submodule, **fsdp_kwargs)
                 fsdp_kwargs = kwargs.copy()
@@ -109,7 +112,7 @@ class FSDP2Wrapper(nn.Module):
                         param_dtype=self.param_dtype,
                         reduce_dtype=self.reduce_dtype,
                         cast_forward_inputs=False))
-                if ignored_params is not None:  # requires torch >= 2.7
+                if len(ignored_params) > 0:  # requires torch >= 2.7
                     fsdp_kwargs.update(ignored_params=ignored_params)
                 fully_shard(module, **fsdp_kwargs)
             self.module._modules[name] = module

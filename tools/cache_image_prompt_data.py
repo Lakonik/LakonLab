@@ -14,13 +14,16 @@ import argparse
 import multiprocessing as mp
 import platform
 import re
-import warnings
 
 import pickle
 import zstandard as zstd
 import gzip
 import orjson
-import cv2
+
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from io import BytesIO
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -28,20 +31,17 @@ import torch.distributed as dist
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
-from io import BytesIO
+import cv2
 from mmcv import Config
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import get_dist_info, init_dist
 from mmcv.fileio import FileClient
 
-from mmgen.apis import set_random_seed
-from mmgen.datasets import build_dataset
-from mmgen.models import build_module
-from mmgen.utils import get_root_logger
-from lakonlab.datasets import build_dataloader
+from lakonlab.models import build_module
+from lakonlab.utils import get_root_logger
+from lakonlab.datasets import build_dataset, build_dataloader
 from lakonlab.parallel import apply_module_wrapper
+from lakonlab.runner.utils import set_random_seed
 
 
 def parse_args():
@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument('--text-encoder', type=str, help='file path to the config of text encoder')
     parser.add_argument(
         '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi'],
+        choices=['none', 'pytorch', 'slurm', 'mpi', 'flyte'],
         default='none',
         help='job launcher')
     group_gpus = parser.add_mutually_exclusive_group()
@@ -159,7 +159,8 @@ def setup_multi_processes(cfg):
     # set multi-process start method as `fork` to speed up the training
     if platform.system() != 'Windows':
         mp_start_method = cfg.get('mp_start_method', 'fork')
-        mp.set_start_method(mp_start_method)
+        if mp.get_start_method(allow_none=True) is None:
+            mp.set_start_method(mp_start_method)
 
     # disable opencv multithreading to avoid system being overloaded
     opencv_num_threads = cfg.get('opencv_num_threads', 0)
@@ -221,7 +222,8 @@ def main():
         world_size = 1
     else:
         distributed = True
-        init_dist(args.launcher, **cfg.dist_params)
+        if args.launcher != 'flyte':  # flyte launcher already sets up the distributed environment
+            init_dist(args.launcher, **cfg.dist_params)
         rank, world_size = get_dist_info()
         cfg.gpu_ids = range(world_size)
     local_world_size = os.environ.get('LOCAL_WORLD_SIZE', 1)

@@ -1,11 +1,11 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
+
+import inspect
+from copy import deepcopy
 
 import torch
-import inspect
 
-from copy import deepcopy
-from mmgen.models.builder import MODELS, build_module
-
+from .builder import MODELS, build_module
 from .base_diffusion import BaseDiffusion
 from lakonlab.utils import rgetattr, first_tensor_device
 
@@ -27,21 +27,12 @@ def cat_prompt_embed_kwargs(prompt_embed_kwargs_list):
     return cat_kwargs
 
 
-@MODELS.register_module()
-class LatentDiffusionTextImage(BaseDiffusion):
-
-    def __init__(self,
-                 *args,
-                 vae=None,
-                 text_encoder=None,
-                 use_condition_latents=False,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-        self.vae = build_module(vae) if vae is not None else None
-        self.text_encoder = build_module(text_encoder) if text_encoder is not None else None
-        self.use_condition_latents = use_condition_latents
+class LatentDiffusionTextImageMixin:
 
     def _prepare_train_minibatch_base_args(self, data):
+        if getattr(self, 'train_cached_latents_as_latents_2', False) and 'latents' in data:
+            data['latents_2'] = data.pop('latents')
+
         if 'prompt_embed_kwargs' in data:
             cond_kwargs = data['prompt_embed_kwargs']
         elif 'prompt_kwargs' in data:
@@ -78,11 +69,22 @@ class LatentDiffusionTextImage(BaseDiffusion):
         else:
             raise ValueError('Either `latents` or `images` should be provided in the input data.')
 
+        if 'latents_2' in data:
+            latents_2 = data['latents_2']
+        elif 'images' in data and getattr(self, 'vae_2', None) is not None:
+            if hasattr(self.vae_2, 'dtype'):
+                vae_2_dtype = self.vae_2.dtype
+            else:
+                vae_2_dtype = next(self.vae_2.parameters()).dtype
+            latents_2 = self.vae_2.encode((data['images'] * 2 - 1).to(vae_2_dtype)).float()
+        else:
+            latents_2 = None
+
         v = next(iter(cond_kwargs.values()))
         bs = len(v)
         device = first_tensor_device(cond_kwargs)
 
-        args = (self.patchify(latents), )
+        args = (self.patchify(latents), ) if latents_2 is None else (self.patchify(latents), self.patchify(latents_2))
 
         return args, cond_kwargs, bs, device
 
@@ -128,27 +130,6 @@ class LatentDiffusionTextImage(BaseDiffusion):
         test_kwargs.update(test_cfg=test_cfg)
 
         return test_kwargs
-
-    def _prepare_train_minibatch_args(self, data, running_status=None):
-        diffusion_args, cond_kwargs, bs, device = \
-            self._prepare_train_minibatch_base_args(data)
-        diffusion_kwargs = cond_kwargs.copy()
-        diffusion_kwargs.update(
-            self._prepare_train_minibatch_extra_kwargs(bs, device, self.train_cfg))
-
-        parameters = inspect.signature(rgetattr(self.diffusion, 'forward_train')).parameters
-        if 'running_status' in parameters:
-            diffusion_kwargs['running_status'] = running_status
-
-        if 'teacher' in parameters and 'teacher_kwargs' in parameters and self.teacher is not None:
-            teacher_kwargs = self._prepare_train_minibatch_test_kwargs(
-                data, cond_kwargs, bs, device, self.train_cfg.get('teacher_test_cfg', dict()))
-
-            diffusion_kwargs.update(
-                teacher=self.teacher,
-                teacher_kwargs=teacher_kwargs)
-
-        return bs, diffusion_args, diffusion_kwargs
 
     def val_step(self, data, test_cfg_override=dict(), **kwargs):
         if 'prompt_embed_kwargs' in data:
@@ -208,6 +189,9 @@ class LatentDiffusionTextImage(BaseDiffusion):
                     distilled_guidance_scale, dtype=torch.float32, device=device)
                 kwargs.update(guidance=distilled_guidance_scale)
 
+            if cfg.get('clamp_denoised', False):
+                kwargs['sample_callback'] = self._get_clamp_denoised_callback()
+
             if 'noise' in data:
                 noise = data['noise']
             else:
@@ -230,3 +214,53 @@ class LatentDiffusionTextImage(BaseDiffusion):
             out_images = (self.vae.decode(latents_out).float() / 2 + 0.5).clamp(min=0, max=1)
 
             return dict(num_samples=bs, pred_imgs=out_images)
+
+
+@MODELS.register_module()
+class LatentDiffusionTextImage(LatentDiffusionTextImageMixin, BaseDiffusion):
+
+    def __init__(self,
+                 *args,
+                 vae=None,
+                 vae_2=None,
+                 text_encoder=None,
+                 use_condition_latents=False,
+                 train_cached_latents_as_latents_2=False,  # True for AsymFlowVR training
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vae = build_module(vae) if vae is not None else None
+        self.vae_2 = build_module(vae_2) if vae_2 is not None else None
+        self.text_encoder = build_module(text_encoder) if text_encoder is not None else None
+        self.use_condition_latents = use_condition_latents
+        self.train_cached_latents_as_latents_2 = train_cached_latents_as_latents_2
+
+    def _prepare_train_minibatch_args(self, data, running_status=None):
+        diffusion_args, cond_kwargs, bs, device = \
+            self._prepare_train_minibatch_base_args(data)
+        diffusion_kwargs = cond_kwargs.copy()
+        diffusion_kwargs.update(
+            self._prepare_train_minibatch_extra_kwargs(bs, device, self.train_cfg))
+
+        parameters = inspect.signature(rgetattr(self.diffusion, 'forward_train')).parameters
+        if 'running_status' in parameters:
+            diffusion_kwargs['running_status'] = running_status
+
+        if 'teacher' in parameters and self.teacher is not None:
+            diffusion_kwargs.update(teacher=self.teacher)
+
+            if 'teacher_kwargs' in parameters:
+                teacher_kwargs = self._prepare_train_minibatch_test_kwargs(
+                    data, cond_kwargs, bs, device, self.train_cfg.get('teacher_test_cfg', dict()))
+                diffusion_kwargs.update(teacher_kwargs=teacher_kwargs)
+
+            if 'teacher_kwargs_2' in parameters:
+                teacher_kwargs_2 = self._prepare_train_minibatch_test_kwargs(
+                    data, cond_kwargs, bs, device, self.train_cfg.get('teacher_test_cfg_2', dict()))
+                diffusion_kwargs.update(teacher_kwargs_2=teacher_kwargs_2)
+
+        if 'vae' in parameters and self.vae is not None:
+            diffusion_kwargs.update(vae=self.vae)
+        if 'vae_2' in parameters and self.vae_2 is not None:
+            diffusion_kwargs.update(vae_2=self.vae_2)
+
+        return bs, diffusion_args, diffusion_kwargs

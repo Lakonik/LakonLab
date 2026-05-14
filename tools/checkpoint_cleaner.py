@@ -1,8 +1,9 @@
-import torch
 import argparse
 import os
 from collections import OrderedDict
 from pathlib import Path
+
+import torch
 
 
 def parse_args():

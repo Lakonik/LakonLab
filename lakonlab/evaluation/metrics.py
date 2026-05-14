@@ -1,32 +1,36 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import os
 import sys
+import json
+import shutil
 import logging
 import pickle
 import warnings
+import hashlib
+from abc import ABC, abstractmethod
+from copy import deepcopy
+from contextlib import contextmanager, redirect_stdout, nullcontext
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
+from PIL import Image
+from scipy import linalg
+from scipy.stats import entropy
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import mmcv
-import hashlib
-
-from copy import deepcopy
-from contextlib import contextmanager, redirect_stdout, nullcontext
-from scipy import linalg
-from scipy.stats import entropy
-from torchvision import models
+from datasets import DatasetDict, load_dataset
 from mmcv.runner import get_dist_info, load_checkpoint
-from mmgen.utils import get_root_logger
-from mmgen.core.registry import METRICS
-from mmgen.core.evaluation.metrics import (
-    Metric, TERO_INCEPTION_URL, _load_inception_torch, MMGEN_CACHE_DIR)
-from mmgen.core.evaluation.metrics import FID as _FID
-from mmgen.core.evaluation.metrics import PR as _PR
 from open_clip import get_tokenizer, create_model
+from lakonlab.utils import get_root_logger
 from lakonlab.utils.io_utils import download_from_huggingface, download_from_url
+from .builder import METRICS
+from .precision_recall import compute_pr_score, compute_pr_score_distributed
 
+TERO_INCEPTION_URL = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/inception-2015-12-05.pt'  # noqa
 
 # Global caches for model loading
 _inception_cache = {}
@@ -86,38 +90,22 @@ def _quarantine_openclip_logging():
 def _load_inception_from_path(inception_path, map_location=None):
     mmcv.print_log(
         'Try to load Tero\'s Inception Model from '
-        f'\'{inception_path}\'.', 'mmgen')
-    try:
-        model = torch.jit.load(inception_path, map_location=map_location)
-        mmcv.print_log('Load Tero\'s Inception Model successfully.', 'mmgen')
-    except Exception as e:
-        model = None
-        mmcv.print_log(
-            'Load Tero\'s Inception Model failed. '
-            f'\'{e}\' occurs.', 'mmgen')
+        f'\'{inception_path}\'.', 'lakonlab')
+    model = torch.jit.load(inception_path, map_location=map_location)
+    mmcv.print_log('Load Tero\'s Inception Model successfully.', 'lakonlab')
     return model
 
 
 def _load_inception_from_url(inception_url, map_location=None):
-    """
-    Fix multi-node downloading issue in MMGen.
-    """
     inception_url = inception_url if inception_url else TERO_INCEPTION_URL
     mmcv.print_log(f'Try to download Inception Model from {inception_url}...',
-                   'mmgen')
-    try:
-        path = download_from_url(inception_url, dest_dir=MMGEN_CACHE_DIR)
-        mmcv.print_log('Download Finished.')
-        return _load_inception_from_path(path, map_location=map_location)
-    except Exception as e:
-        mmcv.print_log(f'Download Failed. {e} occurs.')
-        return None
+                   'lakonlab')
+    path = download_from_url(inception_url)
+    mmcv.print_log('Download Finished.')
+    return _load_inception_from_path(path, map_location=map_location)
 
 
 def load_inception(inception_args, metric, map_location=None):
-    """
-    Fix multi-node downloading issue in MMGen.
-    """
     if not isinstance(inception_args, dict):
         raise TypeError('Receive invalid \'inception_args\': '
                         f'\'{inception_args}\'')
@@ -133,21 +121,8 @@ def load_inception(inception_args, metric, map_location=None):
     _inception_args = deepcopy(inception_args)
     inceptoin_type = _inception_args.pop('type', None)
 
-    if torch.__version__ < '1.6.0':
-        mmcv.print_log(
-            'Current Pytorch Version not support script module, load '
-            'Inception Model from torch model zoo. If you want to use '
-            'Tero\' script model, please update your Pytorch higher '
-            f'than \'1.6\' (now is {torch.__version__})', 'mmgen')
-        result = _load_inception_torch(_inception_args, metric), 'pytorch'
-        _inception_cache[cache_key] = result
-        return result
-
-    # load pytorch version is specific
     if inceptoin_type != 'StyleGAN':
-        result = _load_inception_torch(_inception_args, metric), 'pytorch'
-        _inception_cache[cache_key] = result
-        return result
+        raise NotImplementedError
 
     # try to load Tero's version
     path = _inception_args.get('inception_path', TERO_INCEPTION_URL)
@@ -221,341 +196,113 @@ def load_openclip(
     return _clip_cache[cache_key]
 
 
-def compute_pr_distances(row_features,
-                         col_features,
-                         col_batch_size=10000):
-    dist_batches = []
-    for col_batch in col_features.split(col_batch_size):
-        dist_batch = torch.cdist(
-            row_features.unsqueeze(0), col_batch.unsqueeze(0))[0]
-        dist_batches.append(dist_batch.cpu())
-    return torch.cat(dist_batches, dim=1)
+class Metric(ABC):
+    """The abstract base class of metrics. Basically, we split calculation into
+    three steps. First, we initialize the metric object and do some
+    preparation. Second, we will feed the real and fake images into metric
+    object batch by batch, and we calculate intermediate results of these
+    batches. Finally, We use these intermediate results to summarize the final
+    result. And the result as a string can be obtained by property
+    'result_str'.
 
+    Args:
+        num_images (int): The number of real/fake images needed to calculate
+            metric.
+        image_shape (tuple): Shape of the real/fake images with order "CHW".
+    """
 
-@METRICS.register_module(force=True)
-class PR(_PR):
+    def __init__(self, num_images, image_shape=None):
+        self.num_images = num_images
+        self.image_shape = image_shape
+        self.num_real_need = num_images
+        self.num_fake_need = num_images
+        self.num_real_feeded = 0  # record of the fed real images
+        self.num_fake_feeded = 0  # record of the fed fake images
+        self._result_str = None  # string of metric result
 
-    def __init__(
-            self,
-            num_images=None,
-            image_shape=None,
-            feats_pkl=None,
-            k=3,
-            bgr2rgb=True,
-            vgg16_script=None,
-            inception_args=None,
-            row_batch_size=10000,
-            col_batch_size=10000):
-        super(_PR, self).__init__(num_images, image_shape)
+    @property
+    def result_str(self):
+        """Get results in string format.
 
-        self.feats_pkl = feats_pkl
-
-        self.vgg16 = self.inception_net = None
-        self.device = 'cpu'
-
-        if vgg16_script is not None:
-            mmcv.print_log('loading vgg16 for improved precision and recall...',
-                           'mmgen')
-            if os.path.isfile(vgg16_script):
-                self.vgg16 = torch.jit.load('work_dirs/cache/vgg16.pt', map_location=self.device).eval()
-                self.use_tero_scirpt = True
-            else:
-                mmcv.print_log(
-                    'Cannot load Tero\'s script module. Use official '
-                    'vgg16 instead', 'mmgen')
-                self.vgg16 = models.vgg16(pretrained=True).eval()
-                self.use_tero_scirpt = False
-        elif inception_args is not None:
-            self.inception_net, self.inception_style = load_inception(
-                inception_args, 'FID')
-        else:
-            raise ValueError('Please provide either vgg16_script or inception_args')
-
-        self.k = k
-        self.bgr2rgb = bgr2rgb
-        self.row_batch_size = row_batch_size
-        self.col_batch_size = col_batch_size
-
-    def prepare(self):
-        self.features_of_reals = []
-        self.features_of_fakes = []
-        if self.feats_pkl is not None:
-            assert mmcv.is_filepath(self.feats_pkl)
-            with open(self.feats_pkl, 'rb') as f:
-                reference = pickle.load(f)
-                self.features_of_reals = [torch.from_numpy(feat) for feat in reference['features_of_reals']]
-                self.num_real_feeded = reference['num_real_feeded']
-                mmcv.print_log(
-                    f'Load reference inception pkl from {self.feats_pkl}',
-                    'mmgen')
-
-    def extract_features(self, batch):
-        if self.vgg16 is not None:
-            if self.use_tero_scirpt:
-                batch = (batch * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-                feat = self.vgg16(batch, return_features=True)
-            else:
-                batch = F.interpolate(batch, size=(224, 224))
-                before_fc = self.vgg16.features(batch)
-                before_fc = before_fc.view(-1, 7 * 7 * 512)
-                feat = self.vgg16.classifier[:4](before_fc)
-        else:
-            if self.inception_style == 'StyleGAN':
-                batch = (batch * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-                feat = self.inception_net(batch, return_features=True)
-            else:
-                feat = self.inception_net(batch)[0].view(batch.shape[0], -1)
-        return feat
-
-    @torch.no_grad()
-    def feed_op(self, batch, mode):
-        batch = batch.to(self.device)
-        if self.bgr2rgb:
-            batch = batch[:, [2, 1, 0]]
-
-        feat = self.extract_features(batch)
-
-        if dist.is_initialized():
-            ws = dist.get_world_size()
-            placeholder = [torch.zeros_like(feat) for _ in range(ws)]
-            dist.all_gather(placeholder, feat)
-            feat = torch.stack(placeholder, dim=1).reshape(feat.size(0) * ws, *feat.shape[1:])
-
-        if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
-            if mode == 'reals':
-                self.features_of_reals.append(feat)
-            elif mode == 'fakes':
-                self.features_of_fakes.append(feat)
-            else:
-                raise ValueError(f'{mode} is not a implemented feed mode.')
-
-    def feed(self, batch, mode):
-        if self.num_images is not None:
-            return super().feed(batch, mode)
-        else:
-            self.feed_op(batch, mode)
-
-    @torch.no_grad()
-    def summary(self):
-        gen_features = torch.cat(self.features_of_fakes)
-        real_features = torch.cat(self.features_of_reals).to(device=gen_features.device)
-        if self.num_images is not None:
-            assert gen_features.shape[0] >= self.num_images
-            gen_features = gen_features[:self.num_images]
-            if self.feats_pkl is None:  # real feats not pre-calculated
-                assert real_features.shape[0] >= self.num_images
-                real_features = real_features[:self.num_images]
-
-        self._result_dict = {}
-
-        for name, manifold, probes in [
-            ('precision', real_features, gen_features),
-            ('recall', gen_features, real_features)
-        ]:
-            kth = []
-            for manifold_batch in manifold.split(self.row_batch_size):
-                distance = compute_pr_distances(
-                    row_features=manifold_batch,
-                    col_features=manifold,
-                    col_batch_size=self.col_batch_size)
-                kth.append(
-                    distance.to(torch.float32).kthvalue(self.k + 1).values.to(torch.float16))
-            kth = torch.cat(kth)
-            pred = []
-            for probes_batch in probes.split(self.row_batch_size):
-                distance = compute_pr_distances(
-                    row_features=probes_batch,
-                    col_features=manifold,
-                    col_batch_size=self.col_batch_size)
-                pred.append((distance <= kth).any(dim=1))
-            self._result_dict[name] = float(torch.cat(pred).to(torch.float32).mean())
-
-        precision = self._result_dict['precision']
-        recall = self._result_dict['recall']
-        self._result_str = f'precision: {precision}, recall:{recall}'
-        return self._result_dict
-
-    def clear_fake_data(self):
-        self.features_of_fakes = []
-        self.num_fake_feeded = 0
-
-    def clear(self, clear_reals=False):
-        self.clear_fake_data()
-        if clear_reals:
-            self.features_of_reals = []
-            self.num_real_feeded = 0
-
-    def load_to_gpu(self):
-        """Move models to GPU."""
-        if torch.cuda.is_available():
-            if self.vgg16 is not None:
-                self.vgg16 = self.vgg16.cuda()
-            elif self.inception_net is not None:
-                self.inception_net.cuda()
-            self.device = 'cuda'
-
-    def offload_to_cpu(self):
-        """Move models to CPU."""
-        if self.vgg16 is not None:
-            self.vgg16 = self.vgg16.cpu()
-        elif self.inception_net is not None:
-            self.inception_net.cpu()
-        self.device = 'cpu'
-
-
-@METRICS.register_module(force=True)
-class FID(_FID):
-
-    def __init__(self,
-                 num_images=None,
-                 image_shape=None,
-                 inception_pkl=None,
-                 bgr2rgb=True,
-                 inception_args=dict(normalize_input=False)):
-        super().__init__(
-            num_images,
-            image_shape=image_shape,
-            inception_pkl=inception_pkl,
-            bgr2rgb=bgr2rgb,
-            inception_args=inception_args)
-
-    def prepare(self):
-        if self.inception_pkl is not None:
-            assert mmcv.is_filepath(self.inception_pkl)
-            if self.inception_pkl.startswith('huggingface://'):
-                self.inception_pkl = download_from_huggingface(self.inception_pkl)
-            elif self.inception_pkl.startswith(('http://', 'https://')):
-                self.inception_pkl = download_from_url(self.inception_pkl)
-            with open(self.inception_pkl, 'rb') as f:
-                reference = pickle.load(f)
-                self.real_mean = reference['mean']
-                self.real_cov = reference['cov']
-                mmcv.print_log(
-                    f'Load reference inception pkl from {self.inception_pkl}',
-                    'mmgen')
-            self.num_real_feeded = self.num_images
-
-    @torch.no_grad()
-    def summary(self):
-        # calculate reference inception stat
-        if self.real_mean is None:
-            feats = torch.cat(self.real_feats, dim=0)
-            if self.num_images is not None:
-                assert feats.shape[0] >= self.num_images
-                feats = feats[:self.num_images]
-            feats_np = feats.numpy()
-            self.real_mean = np.mean(feats_np, 0)
-            self.real_cov = np.cov(feats_np, rowvar=False)
-
-        # calculate fake inception stat
-        fake_feats = torch.cat(self.fake_feats, dim=0)
-        if self.num_images is not None:
-            assert fake_feats.shape[0] >= self.num_images
-            fake_feats = fake_feats[:self.num_images]
-        fake_feats_np = fake_feats.numpy()
-        fake_mean = np.mean(fake_feats_np, 0)
-        fake_cov = np.cov(fake_feats_np, rowvar=False)
-
-        # calculate distance between real and fake statistics
-        fid, mean, cov = self._calc_fid(fake_mean, fake_cov, self.real_mean, self.real_cov)
-
-        # results for print/table
-        self._result_str = (f'{fid:.4f} ({mean:.5f}/{cov:.5f})')
-        # results for log_buffer
-        self._result_dict = dict(fid=fid, fid_mean=mean, fid_cov=cov)
-
-        return fid, mean, cov
-
-    def feed(self, batch, mode):
-        if self.num_images is not None:
-            return super().feed(batch, mode)
-        else:
-            self.feed_op(batch, mode)
-
-
-@METRICS.register_module()
-class FIDKID(FID):
-    name = 'FIDKID'
-
-    def __init__(self,
-                 num_images=None,
-                 num_subsets=100,
-                 max_subset_size=1000,
-                 **kwargs):
-        super().__init__(num_images=num_images, **kwargs)
-        self.num_subsets = num_subsets
-        self.max_subset_size = max_subset_size
-        self.real_feats_np = None
-
-    def prepare(self):
-        if self.inception_pkl is not None:
-            assert mmcv.is_filepath(self.inception_pkl)
-            with open(self.inception_pkl, 'rb') as f:
-                reference = pickle.load(f)
-                self.real_mean = reference['mean']
-                self.real_cov = reference['cov']
-                self.real_feats_np = reference['feats_np']
-                mmcv.print_log(
-                    f'Load reference inception pkl from {self.inception_pkl}',
-                    'mmgen')
-            self.num_real_feeded = self.num_images
-
-    @staticmethod
-    def _calc_kid(real_feat, fake_feat, num_subsets, max_subset_size):
-        """Refer to the implementation from:
-        https://github.com/NVlabs/stylegan2-ada-pytorch/blob/main/metrics/kernel_inception_distance.py#L18  # noqa
-        Args:
-            real_feat (np.array): Features of the real samples.
-            fake_feat (np.array): Features of the fake samples.
-            num_subsets (int): Number of subsets to calculate KID.
-            max_subset_size (int): The max size of each subset.
         Returns:
-            float: The calculated kid metric.
+            str: results in string format
         """
-        n = real_feat.shape[1]
-        m = min(min(real_feat.shape[0], fake_feat.shape[0]), max_subset_size)
-        t = 0
-        for _ in range(num_subsets):
-            x = fake_feat[np.random.choice(
-                fake_feat.shape[0], m, replace=False)]
-            y = real_feat[np.random.choice(
-                real_feat.shape[0], m, replace=False)]
-            a = (x @ x.T / n + 1)**3 + (y @ y.T / n + 1)**3
-            b = (x @ y.T / n + 1)**3
-            t += (a.sum() - np.diag(a).sum()) / (m - 1) - b.sum() * 2 / m
+        if not self._result_str:
+            self.summary()
+            return self._result_str
 
-        kid = t / num_subsets / m
-        return float(kid)
+        return self._result_str
 
-    @torch.no_grad()
+    def feed(self, batch, mode):
+        """Feed a image batch into metric calculator and perform intermediate
+        operation in 'feed_op' function.
+
+        Args:
+            batch (Tensor | dict): Images or dict to be fed into
+                metric object. If ``Tensor`` is passed, the order of ``Tensor``
+                should be "NCHW". If ``dict`` is passed, each term in the
+                ``dict`` are ``Tensor`` with order "NCHW".
+            mode (str): Mark the batch as real or fake images. Value can be
+                'reals' or 'fakes',
+        """
+        _, ws = get_dist_info()
+        if mode == 'reals':
+            if self.num_real_feeded == self.num_real_need:
+                return 0
+
+            if isinstance(batch, dict):
+                batch_size = [v for v in batch.values()][0].shape[0]
+                end = min(batch_size,
+                          self.num_real_need - self.num_real_feeded)
+                batch_to_feed = {k: v[:end, ...] for k, v in batch.items()}
+            else:
+                batch_size = batch.shape[0]
+                end = min(batch_size,
+                          self.num_real_need - self.num_real_feeded)
+                batch_to_feed = batch[:end, ...]
+
+            global_end = min(batch_size * ws,
+                             self.num_real_need - self.num_real_feeded)
+            self.feed_op(batch_to_feed, mode)
+            self.num_real_feeded += global_end
+            return end
+
+        elif mode == 'fakes':
+            if self.num_fake_feeded == self.num_fake_need:
+                return 0
+
+            batch_size = batch.shape[0]
+            end = min(batch_size, self.num_fake_need - self.num_fake_feeded)
+            if isinstance(batch, dict):
+                batch_to_feed = {k: v[:end, ...] for k, v in batch.items()}
+            else:
+                batch_to_feed = batch[:end, ...]
+
+            global_end = min(batch_size * ws,
+                             self.num_fake_need - self.num_fake_feeded)
+            self.feed_op(batch_to_feed, mode)
+            self.num_fake_feeded += global_end
+            return end
+        else:
+            raise ValueError(
+                'The expected mode should be set to \'reals\' or \'fakes\','
+                f'but got \'{mode}\'')
+
+    def check(self):
+        """Check the numbers of image."""
+        assert self.num_real_feeded == self.num_fake_feeded == self.num_images
+
+    @abstractmethod
+    def prepare(self, *args, **kwargs):
+        """please implement in subclass."""
+
+    @abstractmethod
+    def feed_op(self, batch, mode):
+        """please implement in subclass."""
+
+    @abstractmethod
     def summary(self):
-        if self.real_feats_np is None:
-            feats = torch.cat(self.real_feats, dim=0)
-            if self.num_images is not None:
-                assert feats.shape[0] >= self.num_images
-                feats = feats[:self.num_images]
-            feats_np = feats.numpy()
-            self.real_feats_np = feats_np
-            self.real_mean = np.mean(feats_np, 0)
-            self.real_cov = np.cov(feats_np, rowvar=False)
-
-        fake_feats = torch.cat(self.fake_feats, dim=0)
-        if self.num_images is not None:
-            assert fake_feats.shape[0] >= self.num_images
-            fake_feats = fake_feats[:self.num_images]
-        fake_feats_np = fake_feats.numpy()
-        fake_mean = np.mean(fake_feats_np, 0)
-        fake_cov = np.cov(fake_feats_np, rowvar=False)
-
-        fid, mean, cov = self._calc_fid(fake_mean, fake_cov, self.real_mean,
-                                        self.real_cov)
-        kid = self._calc_kid(self.real_feats_np, fake_feats_np, self.num_subsets,
-                             self.max_subset_size) * 1000
-
-        self._result_str = f'{fid:.4f} ({mean:.5f}/{cov:.5f}), {kid:.4f}'
-        self._result_dict = dict(fid=fid, fid_mean=mean, fid_cov=cov, kid=kid)
-
-        return fid, mean, cov, kid
+        """please implement in subclass."""
 
 
 @METRICS.register_module()
@@ -568,6 +315,7 @@ class InceptionMetrics(Metric):
                  bgr2rgb=False,
                  center_crop=False,  # SDXL-Lightning patch FID
                  resize=True,
+                 resize_mode='bicubic',
                  inception_args=dict(
                     type='StyleGAN',
                     inception_path=TERO_INCEPTION_URL),
@@ -580,6 +328,7 @@ class InceptionMetrics(Metric):
                  pr_row_batch_size=10000,
                  pr_col_batch_size=10000,
                  is_splits=10,
+                 is_shuffle=False,
                  prefix=''):
         super().__init__(num_images)
         self.reference_pkl = reference_pkl
@@ -591,10 +340,13 @@ class InceptionMetrics(Metric):
         self.bgr2rgb = bgr2rgb
         self.center_crop = center_crop
         self.resize = resize
+        self.resize_mode = resize_mode
         self.device = 'cpu'
 
         if self.center_crop and self.resize:
             warnings.warn('`center_crop` is set to True, `resize` will be ignored.')
+        if self.resize_mode not in ('bicubic', 'bilinear'):
+            raise ValueError(f'Unsupported resize_mode: {self.resize_mode}')
 
         logger = get_root_logger()
         ori_level = logger.level
@@ -615,8 +367,12 @@ class InceptionMetrics(Metric):
         self.pr_k = pr_k
         self.pr_row_batch_size = pr_row_batch_size
         self.pr_col_batch_size = pr_col_batch_size
+        self.cached_precision = None
+        self.cached_recall = None
 
         self.is_splits = is_splits
+        self.is_shuffle = is_shuffle
+
         self.prefix = prefix
 
     def prepare(self):
@@ -624,6 +380,8 @@ class InceptionMetrics(Metric):
         self.real_feats_np = None
         self.fake_feats = []
         self.preds = []
+        self.cached_precision = None
+        self.cached_recall = None
         if self.reference_pkl is not None:
             assert mmcv.is_filepath(self.reference_pkl)
             if self.reference_pkl.startswith('huggingface://'):
@@ -637,6 +395,64 @@ class InceptionMetrics(Metric):
                 self.real_feats_np = reference['real_feats_np']
                 self.real_feats = [torch.from_numpy(reference['real_feats_np'])]
                 self.num_real_feeded = reference['num_real_feeded']
+
+    def _gather_feats(self):
+        real_feats = torch.cat(self.real_feats, dim=0)
+        fake_feats = torch.cat(self.fake_feats, dim=0)
+        if self.num_images is not None:
+            assert fake_feats.shape[0] >= self.num_images
+            fake_feats = fake_feats[:self.num_images]
+            if self.reference_pkl is None:
+                assert real_feats.shape[0] >= self.num_images
+                real_feats = real_feats[:self.num_images]
+        return real_feats.contiguous(), fake_feats.contiguous()
+
+    def _broadcast_feature_matrix(self, features):
+        rank = dist.get_rank()
+
+        if rank == 0:
+            shape = torch.tensor(features.shape, device=self.device, dtype=torch.long)
+        else:
+            shape = torch.empty(2, device=self.device, dtype=torch.long)
+        dist.broadcast(shape, src=0)
+        num_rows, num_cols = shape.tolist()
+
+        if rank == 0:
+            features = features.to(device=self.device, dtype=torch.float32, non_blocking=True).contiguous()
+        else:
+            features = torch.empty((num_rows, num_cols), device=self.device, dtype=torch.float32)
+        dist.broadcast(features, src=0)
+        return features
+
+    def _maybe_finalize_pr(self):
+        if (self.use_pr and self.num_images is not None and self.device == 'cuda'
+                and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+                and (self.cached_precision is None or self.cached_recall is None)
+                and self.num_real_feeded >= self.num_real_need and self.num_fake_feeded >= self.num_fake_need):
+            rank = dist.get_rank()
+
+            real_feats = fake_feats = None
+            if rank == 0:
+                real_feats, fake_feats = self._gather_feats()
+
+            real_feats = self._broadcast_feature_matrix(real_feats)
+            fake_feats = self._broadcast_feature_matrix(fake_feats)
+
+            precision = compute_pr_score_distributed(
+                real_feats,
+                fake_feats,
+                pr_k=self.pr_k,
+                pr_row_batch_size=self.pr_row_batch_size,
+                pr_col_batch_size=self.pr_col_batch_size)
+            recall = compute_pr_score_distributed(
+                fake_feats,
+                real_feats,
+                pr_k=self.pr_k,
+                pr_row_batch_size=self.pr_row_batch_size,
+                pr_col_batch_size=self.pr_col_batch_size)
+
+            self.cached_precision = precision
+            self.cached_recall = recall
 
     @staticmethod
     def _calc_fid(sample_mean, sample_cov, real_mean, real_cov, eps=1e-6):
@@ -707,7 +523,8 @@ class InceptionMetrics(Metric):
             batch = batch[:, :, h_offset:h_offset + crop_size, w_offset:w_offset + crop_size]
         elif self.resize:
             batch = F.interpolate(
-                batch, size=(299, 299), mode='bicubic', align_corners=False, antialias=True).clamp(min=-1, max=1)
+                batch, size=(299, 299), mode=self.resize_mode,
+                align_corners=False, antialias=self.resize_mode == 'bicubic').clamp(min=-1, max=1)
         assert self.inception_style == 'StyleGAN'
         batch = (batch * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         feat = self.inception_net(batch, return_features=True)
@@ -767,6 +584,7 @@ class InceptionMetrics(Metric):
                                  self.num_real_need - self.num_real_feeded)
                 self.feed_op(batch_to_feed, mode)
                 self.num_real_feeded += global_end
+                self._maybe_finalize_pr()
                 return end
 
             elif mode == 'fakes':
@@ -786,7 +604,9 @@ class InceptionMetrics(Metric):
                                  self.num_fake_need - self.num_fake_feeded)
                 self.feed_op(batch_to_feed, mode)
                 self.num_fake_feeded += global_end
+                self._maybe_finalize_pr()
                 return end
+
             else:
                 raise ValueError(
                     'The expected mode should be set to \'reals\' or \'fakes\','
@@ -794,14 +614,7 @@ class InceptionMetrics(Metric):
 
     @torch.no_grad()
     def summary(self):
-        real_feats = torch.cat(self.real_feats, dim=0)
-        fake_feats = torch.cat(self.fake_feats, dim=0)
-        if self.num_images is not None:
-            assert fake_feats.shape[0] >= self.num_images
-            fake_feats = fake_feats[:self.num_images]
-            if self.reference_pkl is None:  # real feats not pre-calculated
-                assert real_feats.shape[0] >= self.num_images
-                real_feats = real_feats[:self.num_images]
+        real_feats, fake_feats = self._gather_feats()
 
         if self.real_feats_np is None:
             real_feats_np = real_feats.numpy()
@@ -833,29 +646,26 @@ class InceptionMetrics(Metric):
 
         # PR
         if self.use_pr:
-            for name, manifold, probes in [
-                (f'{prefix}precision', real_feats, fake_feats),
-                (f'{prefix}recall', fake_feats, real_feats)
-            ]:
-                kth = []
-                for manifold_batch in manifold.split(self.pr_row_batch_size):
-                    distance = compute_pr_distances(
-                        row_features=manifold_batch,
-                        col_features=manifold,
-                        col_batch_size=self.pr_col_batch_size)
-                    kth.append(
-                        distance.to(torch.float32).kthvalue(self.pr_k + 1).values.to(torch.float16))
-                kth = torch.cat(kth)
-                pred = []
-                for probes_batch in probes.split(self.pr_row_batch_size):
-                    distance = compute_pr_distances(
-                        row_features=probes_batch,
-                        col_features=manifold,
-                        col_batch_size=self.pr_col_batch_size)
-                    pred.append((distance <= kth).any(dim=1))
-                self._result_dict[name] = float(torch.cat(pred).to(torch.float32).mean())
-            precision = self._result_dict[f'{prefix}precision']
-            recall = self._result_dict[f'{prefix}recall']
+            if self.cached_precision is not None and self.cached_recall is not None:
+                precision = self.cached_precision
+                recall = self.cached_recall
+            else:
+                real_feats = real_feats.to(device=self.device, dtype=torch.float32, non_blocking=True)
+                fake_feats = fake_feats.to(device=self.device, dtype=torch.float32, non_blocking=True)
+                precision = compute_pr_score(
+                    real_feats,
+                    fake_feats,
+                    pr_k=self.pr_k,
+                    pr_row_batch_size=self.pr_row_batch_size,
+                    pr_col_batch_size=self.pr_col_batch_size)
+                recall = compute_pr_score(
+                    fake_feats,
+                    real_feats,
+                    pr_k=self.pr_k,
+                    pr_row_batch_size=self.pr_row_batch_size,
+                    pr_col_batch_size=self.pr_col_batch_size)
+            self._result_dict[f'{prefix}precision'] = precision
+            self._result_dict[f'{prefix}recall'] = recall
             _result_str += f', {prefix}Precision: {precision:.5f}, {prefix}Recall:{recall:.5f}'
         else:
             precision = recall = None
@@ -868,6 +678,8 @@ class InceptionMetrics(Metric):
                 assert self.preds.shape[0] >= self.num_images
                 self.preds = self.preds[:self.num_images]
             num_preds = self.preds.shape[0]
+            if self.is_shuffle:
+                np.random.shuffle(self.preds)
             for k in range(self.is_splits):
                 part = self.preds[k * (num_preds // self.is_splits):(k + 1) * (num_preds // self.is_splits), :]
                 py = np.mean(part, axis=0)
@@ -890,6 +702,8 @@ class InceptionMetrics(Metric):
         self.fake_feats = []
         self.preds = []
         self.num_fake_feeded = 0
+        self.cached_precision = None
+        self.cached_recall = None
 
     def clear(self, clear_reals=False):
         self.clear_fake_data()
@@ -1327,3 +1141,261 @@ class CLIPSimilarity(Metric):
         self.image_mean = self.image_mean.cpu()
         self.image_std = self.image_std.cpu()
         self.device = 'cpu'
+
+
+class BenchmarkImageExport(Metric):
+    requires_prompt = True
+
+    def __init__(self,
+                 prompt_path=None,
+                 img_root_dir='work_dirs/benchmark_exports',
+                 samples_per_prompt=4,
+                 clear_existing=True,
+                 num_images=None,
+                 prompt_items=None,
+                 prompt_key='prompt',
+                 export_size=1024):
+        if prompt_items is None:
+            assert os.path.exists(prompt_path), f'prompt_path {prompt_path} does not exist.'
+            prompt_items = []
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        prompt_items.append(json.loads(line))
+        self.prompt_path = prompt_path
+        self.img_root_dir = img_root_dir
+        self.samples_per_prompt = samples_per_prompt
+        self.clear_existing = clear_existing
+        self.prompt_items = prompt_items
+        self.prompt_key = prompt_key
+        self.export_size = export_size
+        assert self.prompt_items, f'No prompts found in {prompt_path}.'
+        self.prompt_list = [item[self.prompt_key] for item in self.prompt_items]
+        self.img_buffer = []
+        self.current_idx = 0
+        self.executor = None
+        super().__init__(num_images=num_images or len(self.prompt_items) * samples_per_prompt)
+
+    def prepare(self):
+        ddp_active = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if ddp_active else 0
+        self.img_buffer = []
+        self.current_idx = 0
+        self.executor = None
+        if rank == 0:
+            if self.clear_existing and os.path.exists(self.img_root_dir):
+                shutil.rmtree(self.img_root_dir)
+            os.makedirs(self.img_root_dir, exist_ok=True)
+            self.executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 4)
+        if ddp_active:
+            dist.barrier()
+
+    @abstractmethod
+    def _save_prompt_images(self, imgs, prompt_item, prompt_idx):
+        """please implement in subclass."""
+
+    @torch.no_grad()
+    def feed_op(self, batch, mode):
+        imgs = batch['imgs']
+        if torch.cuda.is_available():
+            imgs = imgs.cuda()
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        if (self.export_size is not None
+                and imgs.shape[-2:] != (self.export_size, self.export_size)):
+            imgs = F.interpolate(
+                imgs,
+                size=(self.export_size, self.export_size),
+                mode='bicubic',
+                align_corners=False,
+                antialias=True).clamp(0, 1)
+        imgs = (imgs.permute(0, 2, 3, 1) * 255).round().to(dtype=torch.uint8).contiguous()
+        prompts = batch['prompts']
+
+        if dist.is_available() and dist.is_initialized():
+            ws = dist.get_world_size()
+            placeholder = [torch.empty_like(imgs) for _ in range(ws)]
+            dist.all_gather(placeholder, imgs)
+            imgs = torch.stack(placeholder, dim=1).reshape(imgs.size(0) * ws, *imgs.shape[1:])
+
+            placeholder_prompts = [None for _ in range(ws)]
+            dist.all_gather_object(placeholder_prompts, prompts)
+            prompts = [p for prompt_batch in zip(*placeholder_prompts) for p in prompt_batch]
+
+        imgs = imgs.cpu().numpy()
+
+        for img, prompt in zip(imgs, prompts):
+            self.img_buffer.append((img, prompt))
+            if len(self.img_buffer) == self.samples_per_prompt:
+                expected_prompt = self.prompt_list[self.current_idx]
+                for _, p in self.img_buffer:
+                    assert p == expected_prompt, (
+                        f'Unexpected prompt order at index {self.current_idx}: '
+                        f'{p!r} != {expected_prompt!r}')
+
+                if self.executor is not None:
+                    imgs_to_save = np.stack([x[0] for x in self.img_buffer], axis=0)
+                    prompt_item = self.prompt_items[self.current_idx]
+                    prompt_idx = self.current_idx
+                    self.executor.submit(
+                        self._save_prompt_images, imgs_to_save, prompt_item, prompt_idx)
+
+                self.img_buffer = []
+                self.current_idx += 1
+                if self.current_idx >= len(self.prompt_items):
+                    break
+
+    def feed(self, batch, mode):
+        if mode == 'reals':
+            return 0
+
+        if self.num_images is None:
+            self.feed_op(batch, mode)
+
+        else:
+            _, ws = get_dist_info()
+
+            if self.num_fake_feeded == self.num_fake_need:
+                return 0
+
+            batch_size = len(list(batch.values())[0])
+            end = min(batch_size, self.num_fake_need - self.num_fake_feeded)
+            batch_to_feed = {k: v[:end] for k, v in batch.items()}
+
+            global_end = min(batch_size * ws,
+                             self.num_fake_need - self.num_fake_feeded)
+            self.feed_op(batch_to_feed, mode)
+            self.num_fake_feeded += global_end
+            return end
+
+    def clear_fake_data(self):
+        self.img_buffer = []
+        self.current_idx = 0
+        self.num_fake_feeded = 0
+
+    def clear(self, clear_reals=False):
+        self.clear_fake_data()
+
+    @torch.no_grad()
+    def summary(self):
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+            self.executor = None
+        self._result_dict = dict()
+        self._result_str = ''
+        return
+
+
+@METRICS.register_module()
+class DPGBenchExport(BenchmarkImageExport):
+    name = 'DPGBenchExport'
+
+    def __init__(self,
+                 prompt_path='data/dpgbench-prompts/prompts.jsonl',
+                 img_root_dir='work_dirs/benchmark_exports/dpgbench',
+                 samples_per_prompt=4,
+                 clear_existing=True,
+                 export_size=1024):
+        assert samples_per_prompt == 4, 'DPGBenchExport expects 4 images for a 2x2 grid.'
+        super().__init__(
+            prompt_path=prompt_path,
+            img_root_dir=img_root_dir,
+            samples_per_prompt=samples_per_prompt,
+            clear_existing=clear_existing,
+            export_size=export_size)
+
+    def _save_prompt_images(self, imgs, prompt_item, prompt_idx):
+        _, h, w, c = imgs.shape
+        assert h == w, (
+            f'DPGBenchExport expects square samples for scorer cropping, got {h}x{w}.')
+        grid = imgs.reshape(2, 2, h, w, c).transpose(
+            0, 2, 1, 3, 4).reshape(2 * h, 2 * w, c)
+        item_id = prompt_item.get('id', f'{prompt_idx:05d}')
+        Image.fromarray(grid).save(os.path.join(self.img_root_dir, f'{item_id}.png'))
+
+
+@METRICS.register_module()
+class GenEvalExport(BenchmarkImageExport):
+    name = 'GenEvalExport'
+
+    def __init__(self,
+                 prompt_path='data/geneval-prompts/prompts.jsonl',
+                 metadata_path='data/geneval-prompts/evaluation_metadata.jsonl',
+                 img_root_dir='work_dirs/benchmark_exports/geneval',
+                 samples_per_prompt=4,
+                 save_grid=True,
+                 clear_existing=True,
+                 export_size=1024):
+        self.metadata_path = metadata_path
+        self.save_grid = save_grid
+        assert os.path.exists(metadata_path), f'metadata_path {metadata_path} does not exist.'
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            self.metadata_items = [json.loads(line) for line in f if line.strip()]
+        super().__init__(
+            prompt_path=prompt_path,
+            img_root_dir=img_root_dir,
+            samples_per_prompt=samples_per_prompt,
+            clear_existing=clear_existing,
+            export_size=export_size)
+        assert len(self.metadata_items) == len(self.prompt_items), (
+            f'GenEval metadata count {len(self.metadata_items)} does not match '
+            f'prompt count {len(self.prompt_items)}.')
+
+    def _save_prompt_images(self, imgs, prompt_item, prompt_idx):
+        prompt_dir = os.path.join(self.img_root_dir, f'{prompt_idx:05d}')
+        sample_dir = os.path.join(prompt_dir, 'samples')
+        os.makedirs(sample_dir, exist_ok=True)
+
+        metadata = self.metadata_items[prompt_idx]
+        with open(os.path.join(prompt_dir, 'metadata.jsonl'), 'w', encoding='utf-8') as f:
+            f.write(json.dumps(metadata, ensure_ascii=False) + '\n')
+
+        for sample_idx, img in enumerate(imgs):
+            Image.fromarray(img).save(os.path.join(sample_dir, f'{sample_idx:04d}.png'))
+
+        if self.save_grid:
+            grid_size = int(np.sqrt(imgs.shape[0]))
+            if grid_size * grid_size == imgs.shape[0]:
+                _, h, w, c = imgs.shape
+                grid = imgs.reshape(grid_size, grid_size, h, w, c).transpose(
+                    0, 2, 1, 3, 4).reshape(grid_size * h, grid_size * w, c)
+                Image.fromarray(grid).save(os.path.join(prompt_dir, 'grid.png'))
+
+
+@METRICS.register_module()
+class HPSv3BenchmarkExport(BenchmarkImageExport):
+    name = 'HPSv3BenchmarkExport'
+
+    def __init__(self,
+                 benchmark_dataset_kwargs,
+                 img_root_dir='work_dirs/benchmark_exports/hpsv3',
+                 prompt_key='caption',
+                 clear_existing=True,
+                 export_size=1024):
+        benchmark_dataset = load_dataset(**benchmark_dataset_kwargs)
+        if isinstance(benchmark_dataset, DatasetDict):
+            split = 'train' if 'train' in benchmark_dataset else list(benchmark_dataset.keys())[0]
+            benchmark_dataset = benchmark_dataset[split]
+        prompt_items = [benchmark_dataset[i] for i in range(len(benchmark_dataset))]
+        super().__init__(
+            prompt_path=None,
+            img_root_dir=img_root_dir,
+            samples_per_prompt=1,
+            clear_existing=clear_existing,
+            num_images=len(prompt_items),
+            prompt_items=prompt_items,
+            prompt_key=prompt_key,
+            export_size=export_size)
+
+    def _save_prompt_images(self, imgs, prompt_item, prompt_idx):
+        assert imgs.shape[0] == 1, 'HPSv3BenchmarkExport expects one image per prompt.'
+        category = prompt_item['category']
+        image_file = prompt_item['image_file']
+        image_stem = os.path.splitext(os.path.basename(image_file))[0]
+        category_dir = os.path.join(self.img_root_dir, category)
+        os.makedirs(category_dir, exist_ok=True)
+
+        Image.fromarray(imgs[0]).save(os.path.join(category_dir, f'{image_stem}.png'))
+        prompt = prompt_item[self.prompt_key]
+        with open(os.path.join(category_dir, f'{image_stem}.txt'), 'w', encoding='utf-8') as f:
+            f.write(prompt)

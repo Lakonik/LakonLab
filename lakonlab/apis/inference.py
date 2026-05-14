@@ -1,13 +1,13 @@
 import torch
 import mmcv
 from mmcv.runner import load_checkpoint
-from mmgen.models import build_model
+from lakonlab.models import build_model
 from lakonlab.runner.hooks.ema_hook import get_ori_key
 
 
 def init_model(
         config, checkpoint=None, device='cuda:0', cfg_options=None,
-        ema_only=True, use_fp16=False, use_bf16=False):
+        ema_only=True, torch_dtype=None):
     if isinstance(config, str):
         config = mmcv.Config.fromfile(config)
     elif not isinstance(config, mmcv.Config):
@@ -22,7 +22,7 @@ def init_model(
     if ema_only:
         module_keys = []
         for hook in config.get('custom_hooks', []):
-            if hook['type'] in ('ExponentialMovingAverageHookMod', 'ExponentialMovingAverageHook'):
+            if hook['type'] == 'ExponentialMovingAverageHook':
                 if isinstance(hook['module_keys'], str):
                     module_keys.append(hook['module_keys'])
                 else:
@@ -36,19 +36,11 @@ def init_model(
 
     model._cfg = config  # save the config in the model for convenience
 
-    for module in model.modules():
-        if hasattr(module, 'bake_lora_weights'):
-            module.bake_lora_weights()
-
-    if use_fp16 or use_bf16:
+    if torch_dtype is not None:
         for m in model.modules():
             if hasattr(m, 'autocast_dtype'):
                 setattr(m, 'autocast_dtype', None)
-        if use_fp16:
-            assert not use_bf16
-            model.to(dtype=torch.float16)
-        elif use_bf16:
-            model.to(dtype=torch.bfloat16)
+        model.to(dtype=getattr(torch, torch_dtype))
 
     model.to(device)
     model.eval()

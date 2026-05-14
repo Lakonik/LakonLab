@@ -116,7 +116,7 @@ checkpoint_config = dict(
 
 evaluation = []
 for data_split in ['val']:
-    prefix = f'step4'
+    prefix = 'step4'
     evaluation.append(
         dict(
             type='GenerativeEvalHook',
@@ -138,7 +138,7 @@ log_config = dict(
 
 custom_hooks = [
     dict(
-        type='ExponentialMovingAverageHookMod',
+        type='ExponentialMovingAverageHook',
         module_keys=('diffusion_ema', ),
         interp_mode='lerp',
         interval=1,
@@ -149,5 +149,5 @@ custom_hooks = [
 ]
 
 load_from = None
-resume_from = f'checkpoints/{name}/latest.txt'  # resume by default
+resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]

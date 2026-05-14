@@ -1,3 +1,8 @@
+# val_sde_em_g1.8(0.0-0.7)_step250_fid = 1.3779400267236106
+# val_sde_em_g1.8(0.0-0.7)_step250_precision = 0.796019971370697
+# val_sde_em_g1.8(0.0-0.7)_step250_recall = 0.6351999640464783
+# val_sde_em_g1.8(0.0-0.7)_step250_is = 306.3859558105469
+
 name = 'repa_imagenet_test'
 
 model = dict(
@@ -17,7 +22,8 @@ model = dict(
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='bfloat16'),
+            torch_dtype='bfloat16',
+            compile_forward=True),
         num_timesteps=1,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
         denoising_mean_mode='U'),
@@ -25,7 +31,6 @@ model = dict(
     inference_only=True)
 
 work_dir = f'work_dirs/{name}'
-# yapf: disable
 train_cfg = dict()
 test_cfg = dict()
 
@@ -40,47 +45,48 @@ data = dict(
         test_mode=True),
     test_dataloader=dict(samples_per_gpu=125),
     persistent_workers=True,
-    prefetch_factor=64)
-
-
-guidance_scales = [3.2]
-guidance_starts = [0.7]
-
-method_name = 'euler'
-method_config = dict(
-    sampler='FlowEulerODE',
+    prefetch_factor=64,
+    multiprocessing_context='fork',
 )
 
-step = 12
-
 evaluation = []
+step = 250
+guidance_scale = 1.8
+guidance_interval = [0.0, 0.7]
 
-for guidance_start in guidance_starts:
-    for guidance_scale in guidance_scales:
-        test_cfg_override = dict(
-            guidance_scale=guidance_scale,
-            guidance_interval=[0, guidance_start],
-            num_timesteps=step)
-        test_cfg_override.update(method_config)
-        prefix = f'{method_name}_g{guidance_scale:.2f}(0-{guidance_start})_step{step}'
-        evaluation.append(
+prefix = f'sde_em_g{guidance_scale}({guidance_interval[0]}-{guidance_interval[1]})_step{step}'
+evaluation.append(
+    dict(
+        type='GenerativeEvalHook',
+        data='val',
+        prefix=prefix,
+        sample_kwargs=dict(
+            test_cfg_override=dict(
+                sampler='FlowSDE',
+                sampler_kwargs=dict(
+                    terminal_sigma=0.04,
+                    h='sqrt(1 - sigma)',
+                    solver_type='euler-maruyama',
+                    use_fp64=True
+                ),
+                guidance_scale=guidance_scale,
+                guidance_interval=guidance_interval,
+                num_timesteps=step,
+            ),
+        ),
+        feed_batch_size=64,
+        metrics=[
             dict(
-                type='GenerativeEvalHook',
-                data='val',
-                prefix=prefix,
-                sample_kwargs=dict(
-                    test_cfg_override=test_cfg_override),
-                feed_batch_size=32,
-                viz_num=256,
-                metrics=[
-                    dict(
-                        type='InceptionMetrics',
-                        num_images=50000,
-                        resize=False,
-                        reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl'),
-                ],
-                viz_dir=f'viz/{name}/{prefix}',
-                save_best_ckpt=False))
+                type='InceptionMetrics',
+                num_images=50000,
+                resize=False,
+                reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl'),
+        ],
+        save_best_ckpt=False,
+        # viz_num=256,
+        # viz_dir=f'viz/{name}/{prefix}',
+    )
+)
 
 dist_params = dict(backend='nccl')
 log_level = 'INFO'

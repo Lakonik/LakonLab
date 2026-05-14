@@ -168,3 +168,77 @@ overlay.addEventListener('wheel', e => {
 
 /* Keep centering correct on resize / browser zoom */
 window.addEventListener('resize', adjustAlignment);
+
+/* ----------------------------------------------------------
+   7.  Pagination (hash-based, single file)
+---------------------------------------------------------- */
+const {pageSize, totalPages} = window.GRID_DATA;
+
+if (pageSize && totalPages > 1) {
+    const items = document.querySelectorAll('.item');
+    const pageInput = document.getElementById('pageInput');
+    const navFirst = document.getElementById('navFirst');
+    const navPrev = document.getElementById('navPrev');
+    const navNext = document.getElementById('navNext');
+    const navLast = document.getElementById('navLast');
+
+    function getPageFromHash() {
+        const match = window.location.hash.match(/page=(\d+)/);
+        return match ? Math.max(1, Math.min(totalPages, parseInt(match[1]))) : 1;
+    }
+
+    function showPage(page) {
+        const start = (page - 1) * pageSize;
+        const end = start + pageSize;
+
+        items.forEach((item, i) => {
+            const visible = i >= start && i < end;
+            item.style.display = visible ? '' : 'none';
+
+            const media = item.querySelector('img, video');
+            if (!media) return;
+
+            if (visible) {
+                // Load: set src from data-src
+                if (media.dataset.src && !media.src) {
+                    media.src = media.dataset.src;
+                }
+            } else {
+                // Unload: remove src to abort pending loads
+                if (media.src) {
+                    media.removeAttribute('src');
+                }
+            }
+        });
+
+        // Update UI
+        pageInput.value = page;
+        navFirst.classList.toggle('disabled', page === 1);
+        navPrev.classList.toggle('disabled', page === 1);
+        navNext.classList.toggle('disabled', page === totalPages);
+        navLast.classList.toggle('disabled', page === totalPages);
+    }
+
+    function goToPage(page) {
+        page = Math.max(1, Math.min(totalPages, page));
+        window.location.hash = 'page=' + page;
+    }
+
+    // Navigation handlers
+    navFirst.addEventListener('click', () => goToPage(1));
+    navPrev.addEventListener('click', () => goToPage(getPageFromHash() - 1));
+    navNext.addEventListener('click', () => goToPage(getPageFromHash() + 1));
+    navLast.addEventListener('click', () => goToPage(totalPages));
+
+    pageInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            goToPage(parseInt(this.value));
+        }
+    });
+
+    // React to hash changes (back/forward buttons)
+    window.addEventListener('hashchange', () => showPage(getPageFromHash()));
+
+    // Initial page load
+    showPage(getPageFromHash());
+}

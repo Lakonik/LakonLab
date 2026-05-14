@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import os
 
@@ -11,8 +11,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from mmcv.fileio import FileClient
 from mmcv.parallel import DataContainer as DC
-from mmgen.datasets.builder import DATASETS
-from mmgen.utils import get_root_logger
+from lakonlab.utils import get_root_logger
+from .builder import DATASETS
 
 
 def image_preproc(pil_image, image_size, random_flip=False):
@@ -61,6 +61,7 @@ class ImageNet(Dataset):
             image_size=256,
             latent_size=(4, 32, 32),
             test_label_repeat=1,
+            test_label_sampling='random',
             test_mode=False,
             num_test_images=50000):
         super().__init__()
@@ -74,6 +75,7 @@ class ImageNet(Dataset):
         self.image_size = image_size
         self.latent_size = latent_size
         self.test_label_repeat = test_label_repeat
+        self.test_label_sampling = test_label_sampling
         self.test_mode = test_mode
         self.num_test_images = num_test_images
 
@@ -124,8 +126,14 @@ class ImageNet(Dataset):
         data = dict(ids=DC(idx, cpu_only=True))
 
         if self.test_mode:
-            label_generator = torch.Generator().manual_seed(idx // self.test_label_repeat)
-            label = torch.randint(0, 1000, (), generator=label_generator).long()
+            label_sample_idx = idx // self.test_label_repeat
+            if self.test_label_sampling == 'equal':
+                label = torch.tensor(label_sample_idx % 1000, dtype=torch.long)
+            elif self.test_label_sampling == 'random':
+                label_generator = torch.Generator().manual_seed(label_sample_idx)
+                label = torch.randint(0, 1000, (), generator=label_generator).long()
+            else:
+                raise ValueError(f'Unsupported test_label_sampling: {self.test_label_sampling}')
             noise_generator = torch.Generator().manual_seed(idx + 1000)
             noise = torch.randn(self.latent_size, generator=noise_generator)
             data.update(noise=noise)

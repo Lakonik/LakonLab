@@ -9,8 +9,7 @@ import numpy as np
 import torch
 import mmcv
 from mmcv import Timer
-from mmgen.utils import get_root_logger
-from lakonlab.utils import reduce_mean
+from lakonlab.utils import reduce_mean, get_root_logger
 
 
 class IterTimer:

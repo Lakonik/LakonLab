@@ -1,13 +1,13 @@
-# Copyright (c) 2025 Hansheng Chen
-
-import importlib
-import torch
-import torch.nn as nn
+# Copyright (c) 2026 Hansheng Chen
 
 from collections import abc
 from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, FullyShardedDataParallel
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.distributed.fsdp.wrap import CustomPolicy
 from torch.distributed.utils import _p_assert
 from torch.distributed.fsdp._runtime_utils import (
     _pre_forward,
@@ -18,6 +18,8 @@ from torch.distributed.fsdp._runtime_utils import (
 )
 from mmcv.parallel.scatter_gather import scatter_kwargs
 from mmcv.parallel import MODULE_WRAPPERS
+
+from lakonlab.utils import get_module_object
 
 
 MODULE_WRAPPERS.register_module(
@@ -76,12 +78,6 @@ def clone_grad_inputs(*args, **kwargs):
     new_args = tuple(_map_structure(a, memo) for a in args)
     new_kwargs = {k: _map_structure(v, memo) for k, v in kwargs.items()}
     return new_args, new_kwargs
-
-
-def get_module_object(path):
-    module_path, attribute = path.rsplit('.', 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, attribute)
 
 
 class FullyShardedDataParallelFix(FullyShardedDataParallel):
@@ -179,38 +175,64 @@ class FSDPWrapper(nn.Module):
             exclude_keys=(),
             tie_key_mappings=None,
             use_orig_params=True,
-            sharding_strategy='HYBRID_SHARD',
+            hybrid_sharding=True,
             **kwargs):
         super().__init__()
         self.module = module
         if fsdp_modules is not None:
             assert isinstance(fsdp_modules, (list, tuple))
-            fsdp_modules = [get_module_object(m) for m in fsdp_modules]
+            fsdp_modules = tuple([get_module_object(m) for m in fsdp_modules])
         else:
-            fsdp_modules = []
+            fsdp_modules = ()
         fsdp_kwargs = kwargs
+        if hybrid_sharding:
+            global_world_size = dist.get_world_size()
+            num_devices_per_node = torch.cuda.device_count()
+            mesh = dist.init_device_mesh(
+                'cuda',
+                (global_world_size // num_devices_per_node, num_devices_per_node),
+                mesh_dim_names=('replicate', 'shard'))
+            fsdp_kwargs.update(
+                device_mesh=mesh,
+                sharding_strategy=ShardingStrategy.HYBRID_SHARD)
+        else:
+            fsdp_kwargs.update(
+                sharding_strategy=ShardingStrategy.FULL_SHARD)
         fsdp_kwargs.update(
             use_orig_params=use_orig_params,
             mixed_precision=MixedPrecision(
                 param_dtype=getattr(torch, param_dtype),
                 reduce_dtype=getattr(torch, reduce_dtype),
                 buffer_dtype=getattr(torch, buffer_dtype),
-                cast_root_forward_inputs=False),
-            sharding_strategy=getattr(ShardingStrategy, sharding_strategy.upper()),
-            auto_wrap_policy=ModuleWrapPolicy(fsdp_modules))
+                cast_root_forward_inputs=False))
         self.to_fsdp(
-            device_id, wrap_frozen_modules, ignore_frozen_parameters, exclude_keys, tie_key_mappings, **fsdp_kwargs)
+            device_id,
+            wrap_frozen_modules,
+            ignore_frozen_parameters,
+            exclude_keys,
+            tie_key_mappings,
+            fsdp_modules=fsdp_modules,
+            **fsdp_kwargs)
 
     def to_fsdp(
             self, device_id, wrap_frozen_modules=False, ignore_frozen_parameters=False,
-            exclude_keys=(), tie_key_mappings=None, **kwargs):
+            exclude_keys=(), tie_key_mappings=None, fsdp_modules=(), **kwargs):
         for name, module in self.module._modules.items():
             if name in exclude_keys or next(module.parameters(), None) is None:
                 module = module.cuda()
             elif all(not p.requires_grad for p in module.parameters()):
                 if wrap_frozen_modules:
                     fsdp_kwargs = kwargs.copy()
-                    fsdp_kwargs.update(use_orig_params=False)
+                    ignored_states = []
+                    for p in module.parameters():
+                        if getattr(p, 'lakonlab_no_shard', False):
+                            p.data = p.data.cuda()
+                            ignored_states.append(p)
+                    fsdp_kwargs.update(
+                        use_orig_params=False,
+                        ignored_states=ignored_states,
+                        auto_wrap_policy=CustomPolicy(
+                            lambda m: isinstance(m, fsdp_modules) and next(m.parameters(), None) is not None))
                     module = FullyShardedDataParallelFix(
                         module,
                         device_id=device_id,
@@ -219,13 +241,15 @@ class FSDPWrapper(nn.Module):
                     module = module.cuda()
             else:
                 fsdp_kwargs = kwargs.copy()
-                if ignore_frozen_parameters:
-                    ignored_states = []
-                    for p in module.parameters():
-                        if not p.requires_grad:
-                            p.data = p.data.cuda()
-                            ignored_states.append(p)
-                    fsdp_kwargs.update(ignored_states=ignored_states)
+                ignored_states = []
+                for p in module.parameters():
+                    if getattr(p, 'lakonlab_no_shard', False) or (ignore_frozen_parameters and not p.requires_grad):
+                        p.data = p.data.cuda()
+                        ignored_states.append(p)
+                fsdp_kwargs.update(
+                    ignored_states=ignored_states,
+                    auto_wrap_policy=CustomPolicy(
+                        lambda m: isinstance(m, fsdp_modules) and next(m.parameters(), None) is not None))
                 module = FullyShardedDataParallelFix(
                     module,
                     device_id=device_id,
@@ -234,8 +258,22 @@ class FSDPWrapper(nn.Module):
 
         if tie_key_mappings is not None:
             # parse tie_key_mappings in the format ('teacher->diffusion', 'teacher->diffusion_ema')
+            src_keys = []
+            tgt_keys = []
             for mapping in tie_key_mappings:
                 src_key, tgt_key = mapping.split('->')
+                src_keys.append(src_key)
+                tgt_keys.append(tgt_key)
+            # detect chained tie_key_mappings
+            chained_keys = sorted(set(src_keys) & set(tgt_keys))
+            if len(chained_keys) > 0:
+                raise ValueError(
+                    'Chained `tie_key_mappings` are not supported in FSDPWrapper. '
+                    f'Found keys used as both source and target: {chained_keys}. '
+                    'Please tie all targets directly from a canonical source, e.g. '
+                    '`teacher->diffusion`, `teacher->diffusion_ema`.')
+            # tie the pre-forward and post-forward calls
+            for src_key, tgt_key in zip(src_keys, tgt_keys):
                 tie_fsdp_modules(
                     self.module._modules[tgt_key], self.module._modules[src_key])
 

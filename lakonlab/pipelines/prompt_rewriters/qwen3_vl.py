@@ -1,7 +1,8 @@
 import os
-import torch
 from typing import List, Sequence, Union, Optional
 from PIL import Image
+
+import torch
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from lakonlab.utils.io_utils import hf_model_loader
 

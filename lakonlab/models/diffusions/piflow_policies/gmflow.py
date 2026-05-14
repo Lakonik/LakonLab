@@ -1,8 +1,9 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
+
+from typing import Dict
 
 import torch
 
-from typing import Dict
 from .base import BasePolicy
 from ..gmflow import gmflow_posterior_mean_jit
 from lakonlab.ops.gmflow_ops.gmflow_ops import gm_temperature

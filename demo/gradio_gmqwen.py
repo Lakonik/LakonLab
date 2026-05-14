@@ -27,7 +27,7 @@ def main():
     pipe = PiQwenImagePipeline.from_pretrained(
         'Qwen/Qwen-Image',
         torch_dtype=torch.bfloat16)
-    pipe.load_piflow_adapter(
+    pipe.load_lakonlab_adapter(
         'Lakonik/pi-Qwen-Image',
         subfolder='gmqwen_k8_piid_4step',
         target_module_name='transformer')

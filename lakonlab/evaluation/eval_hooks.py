@@ -1,21 +1,23 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import sys
 import os
+import math
 import numpy as np
-import torch
-import torch.distributed as dist
-import mmcv
-
+import warnings
+from bisect import bisect_right
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
-from mmcv.runner import HOOKS, get_dist_info
+
+import torch
+import mmcv
+from mmcv.runner import HOOKS, Hook, get_dist_info
 from mmcv.fileio import FileClient
-from mmgen.models.architectures.common import get_module_device
-from mmgen.core import GenerativeEvalHook as _GenerativeEvalHook
-from lakonlab.utils.io_utils import save_image, save_video, load_images_parallel
+from . import build_metric
+from lakonlab.models.architectures.utils import get_module_device
 from lakonlab.runner.timer import default_timers
 from lakonlab.utils import gc_context
+from lakonlab.utils.io_utils import save_image, save_video, load_images_parallel
 from lakonlab.ui.media_viewer import write_html
 
 default_timers.add_timer('total time')
@@ -57,7 +59,7 @@ def evaluate(model, dataloader, metrics=None,
 
     if rank == 0:
         mmcv.print_log(
-            f'Generate {max_num_fakes} fake samples for evaluation', 'mmgen')
+            f'Generate {max_num_fakes} fake samples for evaluation', 'lakonlab')
         pbar = mmcv.ProgressBar(max_num_fakes)
 
     log_vars = dict()
@@ -183,11 +185,11 @@ def evaluate(model, dataloader, metrics=None,
         device = get_module_device(model)
         batch_size_list = torch.tensor(batch_size_list, dtype=torch.float, device=device)
         batch_size_sum = torch.sum(batch_size_list)
-        dist.all_reduce(batch_size_sum, op=dist.ReduceOp.SUM)
+        torch.distributed.all_reduce(batch_size_sum, op=torch.distributed.ReduceOp.SUM)
         for k, v in log_vars.items():
             weigted_values = torch.tensor(log_vars[k], dtype=torch.float, device=device) * batch_size_list
             weigted_values_sum = torch.sum(weigted_values)
-            dist.all_reduce(weigted_values_sum, op=dist.ReduceOp.SUM)
+            torch.distributed.all_reduce(weigted_values_sum, op=torch.distributed.ReduceOp.SUM)
             log_vars[k] = float(weigted_values_sum / batch_size_sum)
     else:
         for k, v in log_vars.items():
@@ -196,7 +198,7 @@ def evaluate(model, dataloader, metrics=None,
     if viz_dir is not None:
         if ws > 1:
             gathered = [None for _ in range(ws)]
-            dist.all_gather_object(gathered, html_entries)
+            torch.distributed.all_gather_object(gathered, html_entries)
             if rank == 0:
                 html_entries = [e for sub in gathered for e in (sub or [])]
         if rank == 0:
@@ -220,25 +222,99 @@ def evaluate(model, dataloader, metrics=None,
 
 
 @HOOKS.register_module(force=True)
-class GenerativeEvalHook(_GenerativeEvalHook):
-    greater_keys = ['acc', 'top', 'AR@', 'auc', 'precision', 'mAP', 'is', 'test_ssim', 'test_psnr']
-    less_keys = ['loss', 'fid', 'kid', 'test_lpips']
-    _supported_best_metrics = ['fid', 'kid', 'is', 'test_ssim', 'test_psnr', 'test_lpips']
+class GenerativeEvalHook(Hook):
+
+    rule_map = {'greater': lambda x, y: x > y, 'less': lambda x, y: x < y}
+    init_value_map = {'greater': -math.inf, 'less': math.inf}
+    greater_keys = ['acc', 'top', 'AR@', 'auc', 'precision', 'mAP', 'is']
+    less_keys = ['loss', 'fid', 'kid']
+    _supported_best_metrics = ['fid', 'kid', 'is']
 
     def __init__(self,
-                 *args,
+                 dataloader,
+                 interval=1,
+                 dist=True,
                  metrics=None,
+                 sample_kwargs=None,
+                 save_best_ckpt=True,
+                 best_metric='fid',
                  data='',
                  viz_dir=None,
                  feed_batch_size=32,
                  viz_num=None,
                  clear_reals=False,
                  prefix='',
-                 metric_cpu_offload=False,
-                 **kwargs):
+                 metric_cpu_offload=False):
         if metrics is None:
             metrics = []
-        super(GenerativeEvalHook, self).__init__(*args, metrics=metrics, **kwargs)
+
+        self.dataloader = dataloader
+        self.dist = dist
+        self.sample_kwargs = sample_kwargs if sample_kwargs else dict()
+        self.save_best_ckpt = save_best_ckpt
+        self.best_metric = best_metric
+
+        if isinstance(interval, int):
+            self.interval = interval
+        elif isinstance(interval, dict):
+            if 'milestones' not in interval or 'interval' not in interval:
+                raise KeyError(
+                    '`milestones` and `interval` must exist in interval dict '
+                    'if you want to use the dynamic interval evaluation '
+                    f'strategy. But receive [{[k for k in interval.keys()]}] '
+                    'in the interval dict.')
+
+            self.milestones = interval['milestones']
+            self.interval = interval['interval']
+            # check if length of interval match with the milestones
+            if len(self.interval) != len(self.milestones) + 1:
+                raise ValueError(
+                    f'Length of `interval`(={len(self.interval)}) cannot '
+                    f'match length of `milestones`(={len(self.milestones)}).')
+
+            # check if milestones is in order
+            for idx in range(len(self.milestones) - 1):
+                former, latter = self.milestones[idx], self.milestones[idx + 1]
+                if former >= latter:
+                    raise ValueError(
+                        'Elements in `milestones` should in ascending order.')
+        else:
+            raise TypeError('`interval` only support `int` or `dict`,'
+                            f'recieve {type(self.interval)} instead.')
+
+        if isinstance(best_metric, str):
+            self.best_metric = [self.best_metric]
+
+        if self.save_best_ckpt:
+            not_supported = set(self.best_metric) - set(
+                self._supported_best_metrics)
+            assert len(not_supported) == 0, (
+                f'{not_supported} is not supported for saving best ckpt')
+
+        self.metrics = build_metric(metrics)
+
+        if isinstance(metrics, dict):
+            self.metrics = [self.metrics]
+
+        for metric in self.metrics:
+            metric.prepare()
+
+        # add support for saving best ckpt
+        if self.save_best_ckpt:
+            self.rule = {}
+            self.compare_func = {}
+            self._curr_best_score = {}
+            self._curr_best_ckpt_path = {}
+            for name in self.best_metric:
+                if name in self.greater_keys:
+                    self.rule[name] = 'greater'
+                else:
+                    self.rule[name] = 'less'
+                self.compare_func[name] = self.rule_map[self.rule[name]]
+                self._curr_best_score[name] = self.init_value_map[
+                    self.rule[name]]
+                self._curr_best_ckpt_path[name] = None
+
         self.data = data
         self.viz_dir = viz_dir
         self.file_client = FileClient.infer_client(
@@ -248,6 +324,31 @@ class GenerativeEvalHook(_GenerativeEvalHook):
         self.clear_reals = clear_reals
         self.prefix = prefix
         self.metric_cpu_offload = metric_cpu_offload
+
+    def get_current_interval(self, runner):
+        """Get current evaluation interval.
+
+        Args:
+            runner (``mmcv.runner.BaseRunner``): The runner.
+        """
+        if isinstance(self.interval, int):
+            return self.interval
+        else:
+            curr_iter = runner.iter + 1
+            index = bisect_right(self.milestones, curr_iter)
+            return self.interval[index]
+
+    def before_run(self, runner):
+        """The behavior before running.
+
+        Args:
+            runner (``mmcv.runner.BaseRunner``): The runner.
+        """
+        if self.save_best_ckpt is not None:
+            if runner.meta is None:
+                warnings.warn('runner.meta is None. Creating an empty one.')
+                runner.meta = dict()
+            runner.meta.setdefault('hook_msgs', dict())
 
     @torch.no_grad()
     def after_train_iter(self, runner):
@@ -268,7 +369,7 @@ class GenerativeEvalHook(_GenerativeEvalHook):
                         for name in self.file_client.list_dir_or_file(viz_dir):
                             self.file_client.remove(self.file_client.join_path(viz_dir, name))
                 if ws > 1:
-                    dist.barrier()
+                    torch.distributed.barrier()
             else:
                 viz_dir = None
             log_vars = evaluate(
@@ -307,3 +408,36 @@ class GenerativeEvalHook(_GenerativeEvalHook):
                         metric.offload_to_cpu()
 
             torch.cuda.empty_cache()
+
+    def _save_best_ckpt(self, runner, new_score, metric_name):
+        """Save checkpoint with best metric score.
+
+        Args:
+            runner (``mmcv.runner.BaseRunner``): The runner.
+            new_score (float): New metric score.
+            metric_name (str): Name of metric.
+        """
+        curr_iter = f'iter_{runner.iter + 1}'
+
+        if self.compare_func[metric_name](new_score,
+                                          self._curr_best_score[metric_name]):
+            best_ckpt_name = f'best_{metric_name}_{curr_iter}.pth'
+            runner.meta['hook_msgs'][f'best_score_{metric_name}'] = new_score
+
+            if self._curr_best_ckpt_path[metric_name] and os.path.isfile(
+                    self._curr_best_ckpt_path[metric_name]):
+                os.remove(self._curr_best_ckpt_path[metric_name])
+
+            self._curr_best_ckpt_path[metric_name] = os.path.join(
+                runner.work_dir, best_ckpt_name)
+            runner.save_checkpoint(
+                runner.work_dir, best_ckpt_name, create_symlink=False)
+            runner.meta['hook_msgs'][
+                f'best_ckpt_{metric_name}'] = self._curr_best_ckpt_path[
+                    metric_name]
+
+            self._curr_best_score[metric_name] = new_score
+            runner.logger.info(
+                f'Now best checkpoint is saved as {best_ckpt_name}.')
+            runner.logger.info(f'Best {metric_name} is {new_score:0.4f} '
+                               f'at {curr_iter}.')

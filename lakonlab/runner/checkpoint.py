@@ -1,31 +1,33 @@
-# Copyright (c) 2025 Hansheng Chen
+# Copyright (c) 2026 Hansheng Chen
 
 import os
 import os.path as osp
 import logging
 import time
 import tempfile
-import subprocess
 import uuid
 import shutil
 import re
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-import mmcv
 from typing import Union, Callable, Optional, List
 from collections import OrderedDict
 from tempfile import TemporaryDirectory
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
 from torch.optim import Optimizer
 from torch.distributed.tensor import DTensor
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions, get_optimizer_state_dict
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullyShardedDataParallel as FSDP
+
 from safetensors.torch import load_file, load
 from diffusers.utils.hub_utils import _get_checkpoint_shard_files
+import mmcv
 from mmcv.runner import CheckpointLoader, get_dist_info, _load_checkpoint
 from mmcv.parallel import is_module_wrapper
+
 from lakonlab.utils import download_from_huggingface, rgetattr
-from lakonlab.utils.io_utils import S3Backend, TMP_DIR, retry
+from lakonlab.utils.io_utils import S3Backend, TMP_DIR, retry, S3_TRANSFER_CONFIG
 from lakonlab.parallel import FSDP2Wrapper
 
 
@@ -146,8 +148,28 @@ def exists_ckpt(filename):
 
 @retry()
 def _load_from_s3(s3_filename, local_filename):
-    cmd = ['aws', 's3', 'cp', s3_filename, local_filename]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+    file_client = S3Backend()
+    bucket, prefix = file_client._split_s3_url(s3_filename)
+    file_client._client.download_file(
+        bucket,
+        prefix,
+        local_filename,
+        Config=S3_TRANSFER_CONFIG,
+    )
+
+
+@retry()
+def _save_to_s3(local_filename, s3_filename):
+    file_client = S3Backend()
+    bucket, prefix = file_client._split_s3_url(s3_filename)
+    extra_args = file_client._infer_s3_extra_args(s3_filename)
+    file_client._client.upload_file(
+        local_filename,
+        bucket,
+        prefix,
+        Config=S3_TRANSFER_CONFIG,
+        ExtraArgs=extra_args,
+    )
 
 
 @CheckpointLoader.register_scheme(prefixes='s3://', force=True)
@@ -262,19 +284,8 @@ def load_from_huggingface(filename, map_location=None):
         filename = filename.replace('huggingface://', '').split('/')
         repo_id = '/'.join(filename[:2])
         repo_subfolder = '/'.join(filename[2:-1])
-        is_dist = dist.is_available() and dist.is_initialized()
-        if is_dist:
-            local_rank = dist.get_node_local_rank()
-        else:
-            local_rank = 0
-        if local_rank == 0:
-            sharded_cached_files = _load_from_huggingface_sharded(
-                repo_id, cached_file, repo_subfolder)
-        if is_dist:
-            dist.barrier()
-        if local_rank > 0:
-            sharded_cached_files = _load_from_huggingface_sharded(
-                repo_id, cached_file, repo_subfolder)
+        sharded_cached_files = _load_from_huggingface_sharded(
+            repo_id, cached_file, repo_subfolder)
         ckpt = OrderedDict()
         for sharded_cached_file in sharded_cached_files:
             ckpt.update(load_from_local(sharded_cached_file, map_location))
@@ -510,9 +521,9 @@ def write_checkpoint_to_file(checkpoint, filepath, create_symlink=False, after_s
             cached_file = tmp.name
             torch.save(checkpoint, tmp)
             tmp.flush()
+            os.fsync(tmp.fileno())
         try:
-            cmd = ['aws', 's3', 'cp', cached_file, filepath]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            _save_to_s3(cached_file, filepath)
         finally:
             os.remove(cached_file)
 

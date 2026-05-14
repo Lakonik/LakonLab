@@ -1,0 +1,3 @@
+from .inline_image_files import install_inline_image_file_middleware
+
+install_inline_image_file_middleware()
