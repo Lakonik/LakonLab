@@ -168,8 +168,8 @@ class _JiT(nn.Module):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def get_cache_hidden_states(self, default=None):
-        return self._cache_storage.get('x', default)
+    def get_cache_hidden_states(self):
+        return self._cache_storage['x']
 
     def clear_cache(self):
         self._cache_storage.clear()

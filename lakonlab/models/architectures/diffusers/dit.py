@@ -151,8 +151,8 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
 
     _cache_storage = dict()
 
-    def get_cache_hidden_states(self, default=None):
-        return self._cache_storage.get('hidden_states', default)
+    def get_cache_hidden_states(self):
+        return self._cache_storage['hidden_states']
 
     def clear_cache(self):
         self._cache_storage.clear()

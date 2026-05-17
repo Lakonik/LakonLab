@@ -18,6 +18,12 @@ class _Flux2Transformer2DModelCache(_Flux2Transformer2DModel):
 
     _cache_storage = dict()
 
+    def get_cache_hidden_states(self):
+        return self._cache_storage['hidden_states']
+
+    def clear_cache(self):
+        self._cache_storage.clear()
+
     @apply_lora_scale("joint_attention_kwargs")
     def forward(
         self,
