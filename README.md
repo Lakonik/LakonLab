@@ -55,11 +55,13 @@ Official PyTorch implementation of the papers:
 
 ## 🔥News
 
-- [May 14, 2026] [AsymFlow](docs/AsymFlow.md) is released!
+- [May 20, 2026] AsymFlow is now supported in our [ComfyUI extension](https://github.com/Lakonik/ComfyUI-piFlow).
 
-- [Dec 12, 2025] pi-FLUX.2 is now available for 4-step image generation and editing! Check out the [pi-FLUX.2 Demo🤗](https://huggingface.co/spaces/Lakonik/pi-FLUX.2). Please re-install the latest version of LakonLab (this repository) to use pi-FLUX.2.
+- [May 14, 2026] [AsymFlow](docs/AsymFlow.md) is released.
 
-- [Nov 7, 2025] [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow) is now available! Supports 4-step sampling of Qwen-Image and Flux.1 dev using 8-bit models on a single consumer-grade GPU, powered by [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
+- [Dec 12, 2025] pi-FLUX.2 is now available for 4-step image generation and editing. Check out the [pi-FLUX.2 Demo🤗](https://huggingface.co/spaces/Lakonik/pi-FLUX.2). Please re-install the latest version of LakonLab (this repository) to use pi-FLUX.2.
+
+- [Nov 7, 2025] [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow) is now available. Supports 4-step sampling of Qwen-Image and Flux.1 dev using 8-bit models on a single consumer-grade GPU, powered by [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 
 ## Installation
 
@@ -97,7 +99,7 @@ To access FLUX models, please accept the [FLUX.2 klein Base 9B conditions](https
 **LakonLab** is a high-performance codebase for experimenting with large diffusion models. Key features of LakonLab include:
 - **Performance optimizations**: Seamless switching between DDP, FSDP, and FSDP2, all supporting gradient accumulation and mixed precision.
 - **Weight tying**: For LoRA fine-tuning, the base weights of the teacher, student, and EMA models are tied, sharing the same underlying memory. This is compatible with DDP and FSDP.
-- **Advanced flow solvers**
+- **Advanced flow solvers**:
   - [FlowSDEScheduler](lakonlab/models/diffusions/schedulers/flow_sde.py): Generic flow SDE solver with an adjustable [diffusion coefficient](https://arxiv.org/pdf/2306.02063). `h=0` corresponds to a flow ODE; `h=1` corresponds to a standard flow SDE; `h='inf'` corresponds to the re-noising sampler in the original [consistency models](https://arxiv.org/pdf/2303.01469). Powers the GM-SDE solver in GMFlow.
   - [FlowMapSDEScheduler](lakonlab/models/diffusions/schedulers/flow_map_sde.py): Generic flow SDE solver for few-step flow map models, similar to above.
 - **Storage backends**: Most I/O operations (e.g., dataloaders, checkpoint I/O) support both local filesystems and AWS S3. In addition, model checkpoints can be loaded from HuggingFace (link format `huggingface://<HF_REPO_NAME>/<PATH_TO_MODEL>`) and HTTP/HTTPS URLs directly.
