@@ -318,7 +318,7 @@ class GaussianFlow(nn.Module):
         return x_t.to(ori_dtype)
 
     def forward_u(
-            self, x_t=None, t=None, guidance_scale=1.0, test_cfg=dict(), return_cfg_bias=False, **kwargs):
+            self, x_t=None, t=None, guidance_scale=1.0, test_cfg=dict(), **kwargs):
         ori_dtype = x_t.dtype
         x_t = x_t.float()
         num_batches = x_t.size(0)
@@ -355,16 +355,10 @@ class GaussianFlow(nn.Module):
             bias = guidance_jit(
                 mean_pos, mean_neg, guidance_scale,
                 orthogonal_guidance, self.u_to_x_0(mean_pos, x_t, t))
-            if return_cfg_bias:
-                return mean_pos.to(ori_dtype), bias.to(ori_dtype)
-            else:
-                return (mean_pos + bias).to(ori_dtype)
+            return (mean_pos + bias).to(ori_dtype)
 
         else:
-            if return_cfg_bias:
-                return denoising_output.to(ori_dtype), torch.zeros_like(denoising_output, dtype=ori_dtype)
-            else:
-                return denoising_output.to(ori_dtype)
+            return denoising_output.to(ori_dtype)
 
     def forward_x_0(self, x_t=None, t=None, t_dst=None, **kwargs):
         raise NotImplementedError
