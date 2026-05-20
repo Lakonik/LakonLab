@@ -13,7 +13,7 @@ Official PyTorch implementation of the papers:
     [Leonidas Guibas](https://geometry.stanford.edu/?member=guibas)<br>
     Stanford University
     <br>
-    [Project Page](https://hanshengchen.com/asymflow) | [arXiv](https://arxiv.org/abs/2605.12964) | [ComfyUI (coming soon)]() | [AsymFLUX.2 klein Demo🤗](https://huggingface.co/spaces/Lakonik/AsymFLUX.2-klein)
+    [Project Page](https://hanshengchen.com/asymflow) | [arXiv](https://arxiv.org/abs/2605.12964) | [ComfyUI](https://github.com/Lakonik/ComfyUI-piFlow) | [AsymFLUX.2 klein Demo🤗](https://huggingface.co/spaces/Lakonik/AsymFLUX.2-klein)
   
     <img src="docs/assets/asymflow/asymflow_teaser.jpg" width="250" alt=""/>    
 
