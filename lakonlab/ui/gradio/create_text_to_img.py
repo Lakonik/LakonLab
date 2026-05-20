@@ -11,6 +11,10 @@ def create_interface_text_to_img(
         args=['last_seed', 'prompt', 'width', 'height', 'steps', 'guidance_scale'],
         rewrite_prompt_api=None, rewrite_prompt_args=['last_seed', 'prompt', 'rewrite_prompt']):
     var_dict = dict()
+
+    def resolve_input(arg):
+        return var_dict[arg] if isinstance(arg, str) else arg
+
     with gr.Blocks(analytics_enabled=False) as interface:
         var_dict['output_image'] = gr.Image(
             type='pil', image_mode='RGB', label='Output image', interactive=False, elem_classes=['vh-img', 'vh-img-700'])
@@ -45,12 +49,12 @@ def create_interface_text_to_img(
                 api_name=False
             ).success(
                 fn=rewrite_prompt_api,
-                inputs=[var_dict[arg] for arg in rewrite_prompt_args],
+                inputs=[resolve_input(arg) for arg in rewrite_prompt_args],
                 outputs=[var_dict['rewritten_prompt'], var_dict['output_image']],
                 concurrency_id='default_group', api_name=False
             ).success(
                 fn=api,
-                inputs=[var_dict[arg] for arg in args],
+                inputs=[resolve_input(arg) for arg in args],
                 outputs=var_dict['output_image'],
                 concurrency_id='default_group', api_name=api_name
             )
@@ -63,7 +67,7 @@ def create_interface_text_to_img(
                 api_name=False
             ).success(
                 fn=api,
-                inputs=[var_dict[arg] for arg in args],
+                inputs=[resolve_input(arg) for arg in args],
                 outputs=var_dict['output_image'],
                 concurrency_id='default_group', api_name=api_name
             )
