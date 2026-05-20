@@ -48,7 +48,7 @@ class _Flux2Transformer2DModelCache(_Flux2Transformer2DModel):
         if cache_mode == 'load':
             hidden_states = self._cache_storage.pop('hidden_states')[-batch_size:]
             temb = self._cache_storage.pop('temb')[-batch_size:]
-            single_stream_mod = tuple(x[-batch_size:] for x in self._cache_storage.pop('single_stream_mod'))
+            single_stream_mod = self._cache_storage.pop('single_stream_mod')[-batch_size:]
             concat_rotary_emb = self._cache_storage.pop('concat_rotary_emb')
 
         else:
