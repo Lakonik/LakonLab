@@ -303,7 +303,7 @@ class GaussianFlow(nn.Module):
 
             if sample_callback is not None:
                 callback_outputs = sample_callback(
-                    self, dict(x_t=x_t, denoising_output=denoising_output, t=t, sampler=sampler))
+                    self, dict(x_t=x_t, denoising_output=denoising_output, t=t))
                 x_t = callback_outputs.get('x_t', x_t)
                 denoising_output = callback_outputs.get('denoising_output', denoising_output)
 
@@ -318,7 +318,7 @@ class GaussianFlow(nn.Module):
         return x_t.to(ori_dtype)
 
     def forward_u(
-            self, x_t=None, t=None, guidance_scale=1.0, test_cfg=dict(), **kwargs):
+            self, x_t=None, t=None, guidance_scale=1.0, test_cfg=dict(), sample_callback=None, **kwargs):
         ori_dtype = x_t.dtype
         x_t = x_t.float()
         num_batches = x_t.size(0)
@@ -355,10 +355,14 @@ class GaussianFlow(nn.Module):
             bias = guidance_jit(
                 mean_pos, mean_neg, guidance_scale,
                 orthogonal_guidance, self.u_to_x_0(mean_pos, x_t, t))
-            return (mean_pos + bias).to(ori_dtype)
+            denoising_output = mean_pos + bias
 
-        else:
-            return denoising_output.to(ori_dtype)
+        if sample_callback is not None:
+            callback_outputs = sample_callback(
+                self, dict(x_t=x_t, denoising_output=denoising_output, t=t))
+            denoising_output = callback_outputs.get('denoising_output', denoising_output)
+
+        return denoising_output.to(ori_dtype)
 
     def forward_x_0(self, x_t=None, t=None, t_dst=None, **kwargs):
         raise NotImplementedError

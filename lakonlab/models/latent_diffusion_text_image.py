@@ -127,6 +127,9 @@ class LatentDiffusionTextImageMixin:
                 distilled_guidance_scale, dtype=torch.float32, device=device)
             test_kwargs.update(guidance=distilled_guidance_scale)
 
+        if test_cfg.get('clamp_denoised', False):
+            test_kwargs.update(sample_callback=self._get_clamp_denoised_callback())
+
         test_kwargs.update(test_cfg=test_cfg)
 
         return test_kwargs
