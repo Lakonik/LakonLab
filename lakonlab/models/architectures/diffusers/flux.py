@@ -87,6 +87,7 @@ class FluxTransformer2DModel(_FluxTransformer2DModel):
                     self.load_lora_adapter(lora_state_dict)
                     self.fuse_lora(lora_scale=pretrained_lora_scale_single)
                     self.unload_lora()
+                    self.requires_grad_(True)  # PEFT freezes the weights after fusing
 
     @staticmethod
     def _prepare_latent_image_ids(height, width, device, dtype):

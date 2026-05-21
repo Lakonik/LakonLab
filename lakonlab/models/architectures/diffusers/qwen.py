@@ -85,6 +85,7 @@ class QwenImageTransformer2DModel(_QwenImageTransformer2DModel):
                     self.load_lora_adapter(lora_state_dict)
                     self.fuse_lora(lora_scale=pretrained_lora_scale_single)
                     self.unload_lora()
+                    self.requires_grad_(True)  # PEFT freezes the weights after fusing
 
     def patchify(self, latents):
         if self.patch_size > 1:
