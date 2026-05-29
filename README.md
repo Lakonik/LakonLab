@@ -122,7 +122,7 @@ To access FLUX models, please accept the [FLUX.2 klein Base 9B conditions](https
 
   - Text-to-image models:
 
-    See examples in [configs/misc](configs/misc) and [lakonlab/models/architecture/diffusers](lakonlab/models/architecture/diffusers).
+    See examples in [configs/misc](configs/misc) and [lakonlab/models/architectures/diffusers](lakonlab/models/architectures/diffusers).
 
 LakonLab uses the configuration system and code structure from [MMCV](https://github.com/open-mmlab/mmcv).
 
