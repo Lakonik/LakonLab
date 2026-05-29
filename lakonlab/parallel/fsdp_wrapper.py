@@ -170,7 +170,7 @@ class FSDPWrapper(nn.Module):
             ignore_frozen_parameters=False,
             param_dtype='bfloat16',
             reduce_dtype='float32',
-            buffer_dtype='bfloat16',
+            buffer_dtype='float32',
             fsdp_modules=None,
             exclude_keys=(),
             tie_key_mappings=None,
