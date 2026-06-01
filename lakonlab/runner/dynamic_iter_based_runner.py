@@ -287,10 +287,12 @@ class DynamicIterBasedRunner(IterBasedRunner):
                         create_symlink=True,
                         after_save_hook=None,
                         asynchronous=False):
+        completed_iter = self.iter + 1
+        epoch = completed_iter // len(self.data_loader)
         if meta is None:
-            meta = dict(iter=self.iter + 1, epoch=self.epoch + 1)
+            meta = dict(iter=completed_iter, epoch=epoch)
         elif isinstance(meta, dict):
-            meta.update(iter=self.iter + 1, epoch=self.epoch + 1)
+            meta.update(iter=completed_iter, epoch=epoch)
         else:
             raise TypeError(
                 f'meta should be a dict or None, but got {type(meta)}')
@@ -375,6 +377,11 @@ class DynamicIterBasedRunner(IterBasedRunner):
                         broadcast_from_rank0=False))
             elif isinstance(self.optimizer, dict):
                 for k in self.optimizer.keys():
+                    if k not in checkpoint['optimizer']:
+                        self.logger.warning(
+                            f'Optimizer state dict does not contain {k}, '
+                            'skipping loading optimizer state for this module.')
+                        continue
                     m = rgetattr(self.model, k)
                     set_optimizer_state_dict(
                         model=m,
