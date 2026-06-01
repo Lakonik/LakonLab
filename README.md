@@ -75,17 +75,18 @@ With the above prerequisites, run `pip install -e . --no-build-isolation` from t
 An example of installation commands is shown below:
 
 ```bash
+# Move to this repository (the folder with setup.py) after cloning
+cd <PATH_TO_YOUR_LOCAL_REPO>
+
 # Create uv environment
 uv venv --python 3.10
 source .venv/bin/activate
 
 # Install Pytorch. Goto https://pytorch.org/get-started/previous-versions/ to select the appropriate version
-pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
 
-# Move to this repository (the folder with setup.py) after cloning
-cd <PATH_TO_YOUR_LOCAL_REPO>
 # Install LakonLab in editable mode
-pip install -e . --no-build-isolation
+uv pip install -e . --no-build-isolation
 ```
 
 Additional notes:
