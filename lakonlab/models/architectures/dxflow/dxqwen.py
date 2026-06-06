@@ -45,7 +45,7 @@ class DXQwenImageTransformer2DModel(QwenImageTransformer2DModel):
         self.p_order = p_order
         self.patch_size = patch_size
 
-        self.init_weights(pretrained, pretrained_adapter, mode='grid' if n_grid > 1 else 'polynomial')
+        self.init_weights(pretrained, pretrained_adapter)
 
         self.use_lora = use_lora
         self.lora_target_modules = lora_target_modules
@@ -74,7 +74,7 @@ class DXQwenImageTransformer2DModel(QwenImageTransformer2DModel):
         if checkpointing:
             self.enable_gradient_checkpointing()
 
-    def init_weights(self, pretrained=None, pretrained_adapter=None, mode='grid'):
+    def init_weights(self, pretrained=None, pretrained_adapter=None):
         if pretrained is not None:
             logger = get_root_logger()
             checkpoint = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
@@ -83,34 +83,14 @@ class DXQwenImageTransformer2DModel(QwenImageTransformer2DModel):
             else:
                 state_dict = checkpoint
             # expand the output channels
-            if mode == 'grid':
-                if 'proj_out.weight' in state_dict and \
-                        state_dict['proj_out.weight'].size(0) == self.out_channels // self.n_grid:
-                    state_dict['proj_out.weight'] = state_dict['proj_out.weight'][None].expand(
-                        self.n_grid, -1, -1).reshape(self.out_channels, -1)
-                if 'proj_out.bias' in state_dict and \
-                        state_dict['proj_out.bias'].size(0) == self.out_channels // self.n_grid:
-                    state_dict['proj_out.bias'] = state_dict['proj_out.bias'][None].expand(
-                        self.n_grid, -1).reshape(self.out_channels)
-            elif mode == 'polynomial':
-                if 'proj_out.weight' in state_dict and \
-                        state_dict['proj_out.weight'].size(0) == self.out_channels // self.p_order:
-                    state_dict['proj_out.weight'] = torch.cat(
-                        [state_dict['proj_out.weight'][None],
-                         torch.zeros(
-                             (self.p_order - 1, *state_dict['proj_out.weight'].size()),
-                             device=state_dict['proj_out.weight'].device, dtype=state_dict['proj_out.weight'].dtype)],
-                        dim=0).reshape(self.out_channels, -1)
-                if 'proj_out.bias' in state_dict and \
-                        state_dict['proj_out.bias'].size(0) == self.out_channels // self.p_order:
-                    state_dict['proj_out.bias'] = torch.cat(
-                        [state_dict['proj_out.bias'][None],
-                         torch.zeros(
-                             (self.p_order - 1, *state_dict['proj_out.bias'].size()),
-                             device=state_dict['proj_out.bias'].device, dtype=state_dict['proj_out.bias'].dtype)],
-                        dim=0).reshape(self.out_channels)
-            else:
-                raise ValueError(f"Unknown mode: {mode}")
+            if 'proj_out.weight' in state_dict and \
+                    state_dict['proj_out.weight'].size(0) == self.out_channels // self.n_grid:
+                state_dict['proj_out.weight'] = state_dict['proj_out.weight'][None].expand(
+                    self.n_grid * self.p_order, -1, -1).reshape(self.out_channels, -1)
+            if 'proj_out.bias' in state_dict and \
+                    state_dict['proj_out.bias'].size(0) == self.out_channels // self.n_grid:
+                state_dict['proj_out.bias'] = state_dict['proj_out.bias'][None].expand(
+                    self.n_grid * self.p_order, -1).reshape(self.out_channels)
             if pretrained_adapter is not None:
                 adapter_state_dict = _load_cached_checkpoint(
                     pretrained_adapter, map_location='cpu', logger=logger)
