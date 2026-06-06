@@ -17,7 +17,7 @@ from lakonlab.runner.checkpoint import write_checkpoint_to_file
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Create a Procrustes latent-to-pixel subspace for pixel AsymFlow finetuning.')
-    parser.add_argument('config', help='AsymFLUX.2 klein training config file.')
+    parser.add_argument('config', help='AsymFlow training config file.')
     parser.add_argument('--out', help='Output checkpoint path. Defaults to `pretrained_linear_proj` in the config.')
     parser.add_argument('--num-images', type=int, default=1000)
     parser.add_argument('--batch-size', type=int, help='Batch size. Defaults to the config train dataloader.')
