@@ -244,7 +244,7 @@ class GenerativeEvalHook(Hook):
                  viz_num=None,
                  clear_reals=False,
                  prefix='',
-                 metric_cpu_offload=False):
+                 metric_cpu_offload=True):
         if metrics is None:
             metrics = []
 
