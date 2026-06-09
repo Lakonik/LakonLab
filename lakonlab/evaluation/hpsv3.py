@@ -22,6 +22,7 @@ from transformers.utils import TensorType
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLVisionBlock, Qwen2VLDecoderLayer
 from mmcv.runner import get_dist_info
 from lakonlab.runner.checkpoint import _load_checkpoint
+from lakonlab.utils.io_utils import hf_model_loader
 from .builder import METRICS
 from .metrics import Metric
 
@@ -387,7 +388,8 @@ def load_hpsv3(device, dtype, use_fsdp=True):
     if cache_key in _hpsv3_cache:
         return _hpsv3_cache[cache_key]
 
-    processor = AutoProcessor.from_pretrained(
+    processor = hf_model_loader(
+        AutoProcessor,
         'Qwen/Qwen2-VL-7B-Instruct', padding_side='right',
     )
     processor.image_processor = Qwen2VLImageProcessor()
@@ -398,7 +400,8 @@ def load_hpsv3(device, dtype, use_fsdp=True):
     special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
     with init_empty_weights():
-        config = Qwen2VLRewardModelBT.config_class.from_pretrained(
+        config = hf_model_loader(
+            Qwen2VLRewardModelBT.config_class,
             'Qwen/Qwen2-VL-7B-Instruct',
         )
         model = Qwen2VLRewardModelBT(

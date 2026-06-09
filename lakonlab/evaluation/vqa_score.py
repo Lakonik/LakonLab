@@ -20,6 +20,7 @@ from transformers.models.t5.modeling_t5 import T5Block
 from transformers.modeling_outputs import Seq2SeqLMOutput
 from mmcv.runner import get_dist_info
 from lakonlab.runner.checkpoint import load_checkpoint
+from lakonlab.utils.io_utils import hf_model_loader
 from .metrics import Metric
 from .builder import METRICS
 
@@ -82,8 +83,10 @@ class CLIPVisionTower(nn.Module):
         self.load_model()
 
     def load_model(self):
-        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        config, _ = CLIPVisionModel.config_class.from_pretrained(
+        self.image_processor = hf_model_loader(
+            CLIPImageProcessor, self.vision_tower_name)
+        config, _ = hf_model_loader(
+            CLIPVisionModel.config_class,
             self.vision_tower_name, return_unused_kwargs=True)
         self.vision_tower = CLIPVisionModel(config)
         self.vision_tower.requires_grad_(False)
@@ -421,10 +424,11 @@ def load_vqascore(device, dtype, use_fsdp=True):
     if cache_key in _vqascore_cache:
         return _vqascore_cache[cache_key]
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = hf_model_loader(
+        AutoTokenizer,
         'google/flan-t5-xxl', use_fast=False, model_max_length=2048)
-    # from_pretrained no longer works with transformers v5
-    config, _ = CLIPT5ForConditionalGeneration.config_class.from_pretrained(
+    config, _ = hf_model_loader(
+        CLIPT5ForConditionalGeneration.config_class,
         'zhiqiulin/clip-flant5-xxl',
         use_cache=False,
         freeze_mm_mlp_adapter=True,
