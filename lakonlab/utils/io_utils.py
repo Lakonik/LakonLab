@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Hansheng Chen
 
 import os
+import shutil
 import time
 import mimetypes
 import tempfile
@@ -21,9 +22,9 @@ from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-import torch.distributed as dist
 from torch.hub import download_url_to_file
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import WeakFileLock
 
 import mmcv
 from mmcv.fileio import BaseStorageBackend, FileClient
@@ -73,6 +74,29 @@ def _download_from_url(url, dest_path, hash_prefix):
     download_url_to_file(url, dest_path, hash_prefix, progress=True)
 
 
+@contextmanager
+def locked_cache_path(path):
+    path = str(path)
+    with WeakFileLock(f'{path}.lock'):
+        if os.path.exists(path):
+            yield path, True
+            return
+
+        tmp_path = f'{path}.tmp.{os.getpid()}'
+        if os.path.isdir(tmp_path):
+            shutil.rmtree(tmp_path, ignore_errors=True)
+        elif os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        try:
+            yield tmp_path, False
+            os.rename(tmp_path, path)
+        finally:
+            if os.path.isdir(tmp_path):
+                shutil.rmtree(tmp_path, ignore_errors=True)
+            elif os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
 def download_from_url(url,
                       dest_path=None,
                       dest_dir=LAKONLAB_CACHE_DIR,
@@ -87,27 +111,15 @@ def download_from_url(url,
     if dest_path.startswith('~'):
         dest_path = os.path.expanduser('~') + dest_path[1:]
 
-    # advoid downloading existed file
+    # advoid downloading existing file
     if os.path.exists(dest_path):
         return dest_path
 
-    is_dist = dist.is_available() and dist.is_initialized()
-
-    if is_dist:
-        local_rank = dist.get_node_local_rank()
-    else:
-        local_rank = 0
-
-    # only download from the master process
-    if local_rank == 0:
-        # mkdir
-        _dir = os.path.dirname(dest_path)
-        mmcv.mkdir_or_exist(_dir)
-        _download_from_url(url, dest_path, hash_prefix)
-
-    # sync the other processes
-    if is_dist:
-        dist.barrier()
+    _dir = os.path.dirname(dest_path)
+    mmcv.mkdir_or_exist(_dir)
+    with locked_cache_path(dest_path) as (local_path, exists):
+        if not exists:
+            _download_from_url(url, local_path, hash_prefix)
 
     return dest_path
 

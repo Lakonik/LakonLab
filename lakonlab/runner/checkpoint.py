@@ -26,7 +26,7 @@ import mmcv
 from mmcv.runner import CheckpointLoader, get_dist_info, _load_checkpoint
 from mmcv.parallel import is_module_wrapper
 
-from lakonlab.utils import download_from_huggingface, rgetattr
+from lakonlab.utils import download_from_huggingface, rgetattr, locked_cache_path
 from lakonlab.utils.io_utils import S3Backend, TMP_DIR, retry
 from lakonlab.parallel import FSDP2Wrapper
 
@@ -166,11 +166,9 @@ def load_from_s3(filename, map_location=None):
         dist.broadcast_object_list(object_list, src=0)
         tmp_file = object_list[0]
 
-    # download the file to temp dir
-    if local_rank == 0:
-        S3Backend().download_file(filename, tmp_file)
-    if ws > 1:
-        dist.barrier()
+    with locked_cache_path(tmp_file) as (local_path, exists):
+        if not exists:
+            S3Backend().download_file(filename, local_path)
 
     # load the temporary file
     if ext == '.txt':
@@ -179,7 +177,6 @@ def load_from_s3(filename, map_location=None):
             _filename = f.read().strip()
         filename = os.path.join(
             os.path.dirname(filename), _filename)  # get the actual checkpoint file path
-        # remove the temporary file
         if ws > 1:
             dist.barrier()
         if local_rank == 0:
@@ -191,7 +188,6 @@ def load_from_s3(filename, map_location=None):
     else:
         ckpt = torch.load(tmp_file, map_location=map_location)
 
-    # remove the temporary file
     if ws > 1:
         dist.barrier()
     if local_rank == 0:
@@ -221,11 +217,9 @@ def load_from_tmp(filename, map_location=None):
         dist.broadcast_object_list(object_list, src=0)
         tmp_file = object_list[0]
 
-    # copy the file to temp dir
-    if local_rank == 0:
-        shutil.copy(src_file, tmp_file)
-    if ws > 1:
-        dist.barrier()
+    with locked_cache_path(tmp_file) as (local_path, exists):
+        if not exists:
+            shutil.copy(src_file, local_path)
 
     # load the temporary file
     if ext == '.safetensors':
@@ -233,7 +227,6 @@ def load_from_tmp(filename, map_location=None):
     else:
         ckpt = torch.load(tmp_file, map_location=map_location)
 
-    # remove the temporary file
     if ws > 1:
         dist.barrier()
     if local_rank == 0:
