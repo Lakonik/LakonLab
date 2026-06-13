@@ -82,10 +82,10 @@ def clone_grad_inputs(*args, **kwargs):
 
 class FullyShardedDataParallelFix(FullyShardedDataParallel):
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def _forward_with_fsdp(self, record_name, forward_impl, *args: Any, **kwargs: Any) -> Any:
         handle = self._handle
         with torch.autograd.profiler.record_function(
-            "FullyShardedDataParallel.forward"
+            f"FullyShardedDataParallel.{record_name}"
         ):
             args, kwargs = _root_pre_forward(self, self, args, kwargs)
             unused = None
@@ -110,10 +110,25 @@ class FullyShardedDataParallelFix(FullyShardedDataParallel):
                     "Expected `FlatParameter` to be on the compute device "
                     f"{self.compute_device} but got {handle.flat_param.device}",
                 )
-            output = self._fsdp_wrapped_module(*args, **kwargs)
+            output = forward_impl(*args, **kwargs)
             return _post_forward(
                 self, handle, _post_forward_reshard, self, unused, output
             )
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self._forward_with_fsdp(
+            'forward', self._fsdp_wrapped_module, *args, **kwargs
+        )
+
+    def register_fsdp_forward_method(self, method_name):
+        def forward_method(*args, **kwargs):
+            return self._forward_with_fsdp(
+                method_name,
+                getattr(self._fsdp_wrapped_module, method_name),
+                *args,
+                **kwargs
+            )
+        setattr(self, method_name, forward_method)
 
 
 def tie_fsdp_modules(tgt_module, src_module, recursive=True):
