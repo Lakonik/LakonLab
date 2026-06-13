@@ -12,6 +12,7 @@ import os
 import itertools
 import argparse
 import multiprocessing as mp
+import pickle
 from io import BytesIO
 
 import torch
@@ -46,10 +47,8 @@ if __name__ == '__main__':
         help='whether to set deterministic options for CUDNN backend.')
     args = parser.parse_args()
 
-    try:
+    if mp.get_start_method(allow_none=True) is None:
         mp.set_start_method('fork')
-    except RuntimeError:
-        pass
 
     init_dist('pytorch')
     rank, ws = get_dist_info()
@@ -70,7 +69,9 @@ if __name__ == '__main__':
         persistent_workers=True, prefetch_factor=max(1, args.batch_size // 4), dist=True, shuffle=False)
 
     encoder = PretrainedVAEEncoder(
-        model_name_or_path='stabilityai/sd-vae-ft-ema', torch_dtype=args.dtype).eval().cuda()
+        model_name_or_path='stabilityai/sd-vae-ft-ema',
+        torch_dtype=args.dtype).eval().cuda()
+    vae_dtype = getattr(torch, args.dtype)
 
     root_file_client = FileClient.infer_client(uri=args.out_data_root)
     datalist_file_client = FileClient.infer_client(uri=args.out_datalist_path)
@@ -81,7 +82,7 @@ if __name__ == '__main__':
         pbar = mmcv.ProgressBar(len(dataset))
 
     for data in dataloader:
-        images = data['images'].to(dtype=getattr(torch, args.dtype)).cuda()
+        images = data['images'].to(dtype=vae_dtype).cuda()
         labels = data['labels']
         paths = data['paths']
 
@@ -90,11 +91,11 @@ if __name__ == '__main__':
         for latent, label, path in zip(latents, labels, list(itertools.chain.from_iterable(paths.data))):
             out_path = root_file_client.join_path(
                 os.path.dirname(path),
-                os.path.splitext(os.path.basename(path))[0] + '.pth'
+                os.path.splitext(os.path.basename(path))[0] + '.pkl'
             )
-            torch_data = dict(x=latent.cpu(), y=label.cpu())
+            torch_data = dict(x=latent.cpu(), y=label.clone())
             bytesio = BytesIO()
-            torch.save(torch_data, bytesio)
+            pickle.dump(torch_data, bytesio, protocol=pickle.HIGHEST_PROTOCOL)
             root_file_client.put(
                 bytesio.getvalue(),
                 root_file_client.join_path(args.out_data_root, out_path))
@@ -109,7 +110,7 @@ if __name__ == '__main__':
         for label, path in zip(dataset.all_labels, dataset.all_paths):
             out_path = root_file_client.join_path(
                 os.path.dirname(path),
-                os.path.splitext(os.path.basename(path))[0] + '.pth'
+                os.path.splitext(os.path.basename(path))[0] + '.pkl'
             )
             lines.append(f'{out_path} {label:d}\n')
         datalist_file_client.put_text(''.join(lines), args.out_datalist_path)

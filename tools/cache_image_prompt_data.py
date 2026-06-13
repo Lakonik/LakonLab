@@ -381,7 +381,7 @@ def main():
                             cached_data['prompt_embed_kwargs']['cap_feats'] = cap_feats_fp8.cpu()
                             cached_data['prompt_embed_kwargs']['cap_feats_scale'] = cap_feats_scale.cpu()
                         else:
-                            cached_data['prompt_embed_kwargs'][k] = v[batch_id].cpu()
+                            cached_data['prompt_embed_kwargs'][k] = v[batch_id].cpu().clone()
                     if 'latents' in outputs_dict:
                         latents_fp8, latents_scale = to_scaled_fp8(outputs_dict['latents'][batch_id])
                         cached_data['latents'] = latents_fp8.cpu()

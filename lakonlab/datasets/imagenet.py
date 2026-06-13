@@ -1,6 +1,9 @@
 # Copyright (c) 2026 Hansheng Chen
 
 import os
+import pickle
+import tarfile
+import tempfile
 
 import numpy as np
 import torch
@@ -11,7 +14,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from mmcv.fileio import FileClient
 from mmcv.parallel import DataContainer as DC
-from lakonlab.utils import get_root_logger
+from lakonlab.utils import get_root_logger, locked_cache_path
 from .builder import DATASETS
 
 
@@ -56,23 +59,31 @@ class ImageNet(Dataset):
             data_root='data/imagenet/train',
             datalist_path='data/imagenet/train.txt',
             label2name_path='data/imagenet/imagenet1000_clsidx_to_labels.txt',
+            ignore_cached_latents=False,
             random_flip=True,
             negative_label=1000,
             image_size=256,
+            return_image_bytes=False,
+            tar_extract_dir=None,
             latent_size=(4, 32, 32),
             test_label_repeat=1,
             test_label_sampling='random',
             test_mode=False,
             num_test_images=50000):
         super().__init__()
-        self.data_root = data_root
+        self.tar_extract_dir = tar_extract_dir
+        self.original_data_root = data_root
+        self.data_root = data_root if test_mode else self.prepare_data_root(data_root)
         self._file_client = None
+        self._data_root_from_tar = self.data_root != self.original_data_root
 
         self.datalist_path = datalist_path
         self.label2name_path = label2name_path
+        self.ignore_cached_latents = ignore_cached_latents
         self.random_flip = random_flip
         self.negative_label = negative_label
         self.image_size = image_size
+        self.return_image_bytes = return_image_bytes
         self.latent_size = latent_size
         self.test_label_repeat = test_label_repeat
         self.test_label_sampling = test_label_sampling
@@ -109,9 +120,38 @@ class ImageNet(Dataset):
                     self.all_labels.append(int(path_label[1]))
 
             logger = get_root_logger()
+            if self._data_root_from_tar:
+                mmcv.print_log(f'Packed data root: {self.original_data_root}', logger=logger)
             mmcv.print_log(f'Data root: {self.data_root}', logger=logger)
             mmcv.print_log(f'Data list path: {self.datalist_path}', logger=logger)
             mmcv.print_log(f'Number of images: {len(self.all_paths)}', logger=logger)
+
+    def prepare_data_root(self, data_root):
+        if not data_root.lower().endswith(('.tar', '.tar.gz', '.tgz')):
+            return data_root
+
+        if self.tar_extract_dir is None:
+            tar_name = os.path.basename(data_root)
+            for suffix in ('.tar.gz', '.tgz', '.tar'):
+                if tar_name.endswith(suffix):
+                    tar_name = tar_name[:-len(suffix)]
+                    break
+            extract_dir = os.path.join(tempfile.gettempdir(), tar_name)
+        else:
+            extract_dir = self.tar_extract_dir
+
+        extract_parent = os.path.dirname(extract_dir)
+        assert extract_parent
+        os.makedirs(extract_parent, exist_ok=True)
+        with locked_cache_path(extract_dir) as (local_path, exists):
+            if not exists:
+                os.makedirs(local_path, exist_ok=True)
+                file_client = FileClient.infer_client(uri=data_root)
+                with file_client.get_local_path(data_root) as local_tar_path:
+                    with tarfile.open(local_tar_path, mode='r:*') as tar:
+                        tar.extractall(local_path)
+
+        return extract_dir
 
     @property
     def file_client(self):
@@ -142,18 +182,45 @@ class ImageNet(Dataset):
             rel_data_path = self.all_paths[idx]
             data.update(paths=DC(rel_data_path, cpu_only=True))
             data_path = self.file_client.join_path(self.data_root, rel_data_path)
-            data_bytesio = BytesIO(self.file_client.get(data_path))
+            data_bytes = self.file_client.get(data_path)
+            data_bytesio = BytesIO(data_bytes)
             ext = os.path.splitext(data_path)[-1]
-            if ext.lower() in ('.pth', '.pt'):
-                torch_data = torch.load(data_bytesio, map_location='cpu')
-                label = torch_data['y'].long()
-                data.update(latents=torch_data['x'].float())
+            if ext.lower() in ('.pth', '.pt', '.pkl'):
+                if ext.lower() == '.pkl':
+                    torch_data = pickle.load(data_bytesio)
+                else:
+                    torch_data = torch.load(data_bytesio, map_location='cpu')
+                label = torch.as_tensor(torch_data['y'], dtype=torch.long)
+                if self.ignore_cached_latents:
+                    assert 'image_bytes' in torch_data
+                    img_data = Image.open(BytesIO(torch_data['image_bytes']))
+                    data.update(
+                        images=torch.from_numpy(image_preproc(
+                            img_data, self.image_size, random_flip=self.random_flip
+                        )).float().permute(2, 0, 1) / 255.0)
+                else:
+                    if 'x_std' in torch_data:
+                        mean = torch_data['x_mean'].float()
+                        std = torch_data['x_std'].float()
+                        data.update(latents=mean + std * torch.randn_like(mean))
+                    else:
+                        data.update(latents=torch_data['x'].float())
+                    if 'image_bytes' in torch_data:
+                        assert not self.random_flip
+                        img_data = Image.open(BytesIO(torch_data['image_bytes']))
+                        data.update(
+                            images=torch.from_numpy(image_preproc(
+                                img_data, self.image_size, random_flip=self.random_flip
+                            )).float().permute(2, 0, 1) / 255.0)
             elif ext.lower() in ('.jpg', '.jpeg', '.png'):
                 label = torch.tensor(self.all_labels[idx], dtype=torch.long)
+                if self.return_image_bytes:
+                    data.update(image_bytes=DC(data_bytes, cpu_only=True))
                 img_data = Image.open(data_bytesio)
                 data.update(
                     images=torch.from_numpy(image_preproc(
-                        img_data, self.image_size, random_flip=self.random_flip)).float().permute(2, 0, 1) / 255.0)
+                        img_data, self.image_size, random_flip=self.random_flip
+                    )).float().permute(2, 0, 1) / 255.0)
             else:
                 raise ValueError(f'Unsupported file extension: {ext}')
 
