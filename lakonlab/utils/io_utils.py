@@ -4,6 +4,7 @@ import os
 import time
 import mimetypes
 import tempfile
+import uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -303,19 +304,46 @@ class S3Backend(BaseStorageBackend):
     def join_path(filepath: Union[str, Path], *filepaths: Union[str, Path]) -> str:
         return os.path.join(str(filepath), *(str(p) for p in filepaths))
 
+    @retry()
+    @_refresh_s3_client
+    def download_file(self, filepath: Union[str, Path], local_path: Union[str, Path]) -> None:
+        filepath = str(filepath)
+        bucket, prefix = self._split_s3_url(filepath)
+        self._client.download_file(
+            bucket,
+            prefix,
+            str(local_path),
+            Config=S3_TRANSFER_CONFIG,
+        )
+
+    @retry()
+    @_refresh_s3_client
+    def upload_file(self, local_path: Union[str, Path], filepath: Union[str, Path]) -> None:
+        filepath = str(filepath)
+        bucket, prefix = self._split_s3_url(filepath)
+        extra_args = self._infer_s3_extra_args(filepath)
+        self._client.upload_file(
+            str(local_path),
+            bucket,
+            prefix,
+            Config=S3_TRANSFER_CONFIG,
+            ExtraArgs=extra_args,
+        )
+
     @contextmanager
     def get_local_path(
             self,
-            filepath: Union[str, Path],
-            **kwargs) -> Generator[Union[str, Path], None, None]:
+            filepath: Union[str, Path]) -> Generator[Union[str, Path], None, None]:
         assert self.isfile(filepath)
+        cached_file = None
         try:
-            f = tempfile.NamedTemporaryFile(delete=False, **kwargs)
-            f.write(self.get(filepath))
-            f.close()
-            yield f.name
+            filepath = str(filepath)
+            cached_file = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()) + os.path.splitext(filepath)[-1])
+            self.download_file(filepath, cached_file)
+            yield cached_file
         finally:
-            os.remove(f.name)
+            if cached_file is not None and os.path.exists(cached_file):
+                os.remove(cached_file)
 
     @retry()
     @_refresh_s3_client

@@ -27,7 +27,7 @@ from mmcv.runner import CheckpointLoader, get_dist_info, _load_checkpoint
 from mmcv.parallel import is_module_wrapper
 
 from lakonlab.utils import download_from_huggingface, rgetattr
-from lakonlab.utils.io_utils import S3Backend, TMP_DIR, retry, S3_TRANSFER_CONFIG
+from lakonlab.utils.io_utils import S3Backend, TMP_DIR, retry
 from lakonlab.parallel import FSDP2Wrapper
 
 
@@ -146,32 +146,6 @@ def exists_ckpt(filename):
         raise NotImplementedError()
 
 
-@retry()
-def _load_from_s3(s3_filename, local_filename):
-    file_client = S3Backend()
-    bucket, prefix = file_client._split_s3_url(s3_filename)
-    file_client._client.download_file(
-        bucket,
-        prefix,
-        local_filename,
-        Config=S3_TRANSFER_CONFIG,
-    )
-
-
-@retry()
-def _save_to_s3(local_filename, s3_filename):
-    file_client = S3Backend()
-    bucket, prefix = file_client._split_s3_url(s3_filename)
-    extra_args = file_client._infer_s3_extra_args(s3_filename)
-    file_client._client.upload_file(
-        local_filename,
-        bucket,
-        prefix,
-        Config=S3_TRANSFER_CONFIG,
-        ExtraArgs=extra_args,
-    )
-
-
 @CheckpointLoader.register_scheme(prefixes='s3://', force=True)
 def load_from_s3(filename, map_location=None):
     ext = os.path.splitext(filename)[-1].lower()
@@ -194,7 +168,7 @@ def load_from_s3(filename, map_location=None):
 
     # download the file to temp dir
     if local_rank == 0:
-        _load_from_s3(filename, tmp_file)
+        S3Backend().download_file(filename, tmp_file)
     if ws > 1:
         dist.barrier()
 
@@ -516,6 +490,7 @@ def write_checkpoint_to_file(checkpoint, filepath, create_symlink=False, after_s
             model.create_file(checkpoint_file, name=model_name)
 
     elif filepath.startswith('s3://'):
+        file_client = S3Backend()
         ext = os.path.splitext(filepath)[-1].lower()
         with tempfile.NamedTemporaryFile(dir=TMP_DIR, suffix=ext, delete=False) as tmp:
             cached_file = tmp.name
@@ -523,7 +498,7 @@ def write_checkpoint_to_file(checkpoint, filepath, create_symlink=False, after_s
             tmp.flush()
             os.fsync(tmp.fileno())
         try:
-            _save_to_s3(cached_file, filepath)
+            file_client.upload_file(cached_file, filepath)
         finally:
             os.remove(cached_file)
 
@@ -531,7 +506,7 @@ def write_checkpoint_to_file(checkpoint, filepath, create_symlink=False, after_s
             # S3 does not support real symlinks, so we create a 'latest.txt'
             # containing the relative path of the latest checkpoint
             dst_file = osp.join(osp.dirname(filepath), 'latest.txt')
-            S3Backend().put_text(osp.basename(filepath), dst_file)
+            file_client.put_text(osp.basename(filepath), dst_file)
 
     else:
         mmcv.mkdir_or_exist(osp.dirname(filepath))
