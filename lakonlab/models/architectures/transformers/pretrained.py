@@ -17,6 +17,11 @@ class PretrainedDinoV2(nn.Module):
                  freeze=True,
                  eval_mode=True,
                  torch_dtype='float32',
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='reduce-overhead',
+                     fullgraph=True,
+                     dynamic=False),
                  **kwargs):
         super().__init__()
         if torch_dtype is not None:
@@ -31,6 +36,9 @@ class PretrainedDinoV2(nn.Module):
             self.requires_grad_(False)
         if self.eval_mode:
             self.eval()
+        self._compiled_forward = None
+        if compile_forward:
+            self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
 
     @property
     def dtype(self):
@@ -57,9 +65,14 @@ class PretrainedDinoV2(nn.Module):
         images = (images - self.mean) / self.std
         return images
 
-    def forward(self, images):
-        pixel_values = self.preprocess(images).to(self.dtype)
+    def _forward_impl(self, pixel_values):
         outputs = self.model(pixel_values=pixel_values, return_dict=True)
         hidden_states = outputs.last_hidden_state
         num_register_tokens = getattr(self.model.config, 'num_register_tokens', 0)
         return hidden_states[:, 1 + num_register_tokens:]
+
+    def forward(self, images):
+        pixel_values = self.preprocess(images).to(self.dtype)
+        if self._compiled_forward is not None:
+            return self._compiled_forward(pixel_values).clone()
+        return self._forward_impl(pixel_values)
