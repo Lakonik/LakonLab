@@ -18,12 +18,17 @@ def prepare_module_wrapper(cfg):
 
 
 def apply_module_wrapper(model, module_wrapper, cfg):
+    ddp_kwargs = cfg.get('ddp_kwargs', {}).copy()
+    ddp_kwargs.setdefault(
+        'find_unused_parameters',
+        cfg.get('find_unused_parameters', False))
+    fsdp_kwargs = cfg.get('fsdp_kwargs', {})
     if module_wrapper is None:
         model = MMDistributedDataParallelFix(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=True,
-            find_unused_parameters=cfg.get('find_unused_parameters', False))
+            **ddp_kwargs)
         model.broadcast_buffers = False  # https://github.com/pytorch/pytorch/issues/177514
     elif module_wrapper.lower() == 'ddp':
         mmcv.print_log('Use DDP Wrapper.', 'lakonlab')
@@ -31,17 +36,15 @@ def apply_module_wrapper(model, module_wrapper, cfg):
             model,
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,
-            find_unused_parameters=cfg.get('find_unused_parameters', False))
+            **ddp_kwargs)
     elif module_wrapper.lower() == 'fsdp':
         mmcv.print_log('Use FSDP Wrapper.', 'lakonlab')
-        fsdp_kwargs = cfg.get('fsdp_kwargs', {})
         model = FSDPWrapper(
             model,
             device_id=torch.cuda.current_device(),
             **fsdp_kwargs)
     elif module_wrapper.lower() == 'fsdp2':
         mmcv.print_log('Use FSDP2 Wrapper.', 'lakonlab')
-        fsdp_kwargs = cfg.get('fsdp_kwargs', {})
         model = FSDP2Wrapper(
             model,
             **fsdp_kwargs)
