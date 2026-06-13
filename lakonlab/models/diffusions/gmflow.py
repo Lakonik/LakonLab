@@ -393,7 +393,11 @@ class GMFlow(GMFlowMixin, GaussianFlow):
             output = gm_transpose_t_first(output)  # (bs, t, c, h, w)
         return output
 
-    def forward_train(self, x_0, **kwargs):
+    def forward_train(
+            self,
+            x_0,
+            running_status=None,
+            **kwargs):
         device = get_module_device(self)
 
         num_batches = x_0.size(0)
@@ -425,14 +429,20 @@ class GMFlow(GMFlowMixin, GaussianFlow):
 
         denoising_output = self.pred(x_t_high, t_high, **kwargs)
         loss = self.loss(denoising_output, x_t_low, x_t_high, t_low, t_high)
-        log_vars = self.flow_loss.log_vars
-        log_vars.update(loss_transition=float(loss))
+        log_vars = self.flow_loss.log_vars.copy()
+
+        log_this_step = (
+            running_status is None or
+            running_status['iteration'] % self.train_cfg.get('log_interval', 1) == 0)
+        if log_this_step:
+            log_vars.update(loss_transition=float(loss.detach()))
 
         if self.spectrum_net is not None:
             # Note: only support 2D power spectrum for now.
             loss_spectral = self.spectral_loss(denoising_output, x_0, x_t_high, t_high)
-            log_vars.update(loss_spectral=float(loss_spectral))
             loss = loss + loss_spectral
+            if log_this_step:
+                log_vars.update(loss_spectral=float(loss_spectral.detach()))
 
         return loss, log_vars
 

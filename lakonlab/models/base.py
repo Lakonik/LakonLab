@@ -95,12 +95,16 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
     - Gradient clipping
     """
 
-    def step_optimizer(self, optimizer, loss_scaler, running_status):
+    def step_optimizer(self, optimizer, loss_scaler, running_status=None):
+        log_this_step = (
+            running_status is None or
+            running_status['iteration'] % self.train_cfg.get('log_interval', 1) == 0)
         log_vars = dict()
         for k, v in optimizer.items():
             grad_clip = self.train_cfg.get(k + '_grad_clip', 0.0)
             grad_clip_begin_iter = self.train_cfg.get(k + '_grad_clip_begin_iter', 0)
             grad_clip_skip_ratio = self.train_cfg.get(k + '_grad_clip_skip_ratio', 0.0)
+            grad_clip_check_finite = self.train_cfg.get(k + '_grad_clip_check_finite', True)
             skip_step = False
             if loss_scaler is not None:
                 loss_scaler.unscale_(v)
@@ -112,12 +116,13 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
                     grad_norm = kai_zhang_clip_grad(m, grad_clip)
                 else:
                     grad_norm = torch.nn.utils.clip_grad_norm_(m.parameters(), grad_clip)
-                if torch.logical_or(grad_norm.isnan(), grad_norm.isinf()).item() or (
+                if (grad_clip_check_finite and torch.logical_or(grad_norm.isnan(), grad_norm.isinf()).item()) or (
                         grad_clip_skip_ratio > 0 and grad_norm > grad_clip * grad_clip_skip_ratio):
                     grad_norm = float('nan')
                     v.zero_grad()
                     skip_step = True
-                log_vars.update({k + '_grad_norm': float(grad_norm)})
+                if log_this_step:
+                    log_vars.update({k + '_grad_norm': float(grad_norm)})
             if not skip_step:
                 if loss_scaler is None:
                     v.step()
