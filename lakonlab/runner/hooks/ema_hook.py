@@ -41,7 +41,8 @@ class ExponentialMovingAverageHook(Hook):
                  interval=-1,
                  start_iter=0,
                  momentum_policy='fixed',
-                 momentum_cfg=None):
+                 momentum_cfg=None,
+                 foreach=True):
         super().__init__()
         self.trainable_only = trainable_only
         # check args
@@ -64,6 +65,7 @@ class ExponentialMovingAverageHook(Hook):
             module_name = k.split('.')[0]
             assert module_name.endswith('_ema') or module_name.endswith('_ema2')
         self.interp_mode = interp_mode
+        self.foreach = foreach
         self.interp_cfg = dict() if interp_cfg is None else deepcopy(
             interp_cfg)
         self.interval = interval
@@ -82,14 +84,54 @@ class ExponentialMovingAverageHook(Hook):
                 self, momentum_policy
             ), f'Currently, we do not support {self.momentum_policy} for EMA.'
             self.momentum_updater = getattr(self, momentum_policy)
+        self._module_cache = {}
+
+    def _build_module_cache(self, model, module_keys=None):
+        if module_keys is None:
+            module_keys = self.module_keys
+
+        for key in module_keys:
+            net = rgetattr(model, get_ori_key(key))
+            ema = rgetattr(model, key)
+            cache = dict()
+
+            grouped_params = {}
+            fallback_params = []
+            for p_net, p_ema in zip(net.parameters(), ema.parameters()):
+                if not self.foreach or p_net.data.device != p_ema.data.device or p_net.data.dtype != p_ema.data.dtype:
+                    fallback_params.append((p_net, p_ema))
+                    continue
+                group_key = (p_net.requires_grad, p_net.data.device, p_net.data.dtype)
+                if group_key not in grouped_params:
+                    grouped_params[group_key] = ([], [])
+                grouped_params[group_key][0].append(p_net.data)
+                grouped_params[group_key][1].append(p_ema.data)
+            cache['grouped_params'] = grouped_params
+            cache['fallback_params'] = fallback_params
+
+            grouped_buffers = {}
+            fallback_buffers = []
+            for b_net, b_ema in zip(net.buffers(), ema.buffers()):
+                if not self.foreach or b_net.data.device != b_ema.data.device or b_net.data.dtype != b_ema.data.dtype:
+                    fallback_buffers.append((b_net, b_ema))
+                    continue
+                group_key = (b_net.data.device, b_net.data.dtype)
+                if group_key not in grouped_buffers:
+                    grouped_buffers[group_key] = ([], [])
+                grouped_buffers[group_key][0].append(b_net.data)
+                grouped_buffers[group_key][1].append(b_ema.data)
+            cache['grouped_buffers'] = grouped_buffers
+            cache['fallback_buffers'] = fallback_buffers
+
+            self._module_cache[key] = cache
 
     @staticmethod
-    def lerp(a, b, momentum=0.999, momentum_nontrainable=0., trainable=True):
+    def lerp(a, b, momentum=0.999, momentum_nontrainable=0., trainable=True, foreach=False):
         """Does a linear interpolation of two parameters/ buffers.
 
         Args:
-            a (torch.Tensor): Interpolation start point, refer to orig state.
-            b (torch.Tensor): Interpolation end point, refer to ema state.
+            a (torch.Tensor or list[torch.Tensor]): Interpolation start point, refer to orig state.
+            b (torch.Tensor or list[torch.Tensor]): Interpolation end point, refer to ema state.
             momentum (float, optional): The weight for the interpolation
                 formula. Defaults to 0.999.
             momentum_nontrainable (float, optional): The weight for the
@@ -98,12 +140,12 @@ class ExponentialMovingAverageHook(Hook):
             trainable (bool, optional): Whether input parameters is trainable.
                 If set to False, momentum_nontrainable will be used.
                 Defaults to True.
-
-        Returns:
-            torch.Tensor: Interpolation result.
         """
         m = momentum if trainable else momentum_nontrainable
-        return a + (b - a) * m
+        if foreach:
+            torch._foreach_lerp_(b, a, 1 - m)
+        else:
+            b.lerp_(a, 1 - m)
 
     @staticmethod
     def rampup(runner, ema_kimg=10, ema_rampup=0.05, batch_size=4, eps=1e-8):
@@ -164,17 +206,35 @@ class ExponentialMovingAverageHook(Hook):
                     ema_is_sharded = ema._get_fsdp_state()._fsdp_param_group.is_sharded
                     if net_is_sharded and not ema_is_sharded:
                         ema.reshard()
+                        self._build_module_cache(model, module_keys=(key, ))
 
-                for p_net, p_ema in zip(net.parameters(), ema.parameters()):
+                cache = self._module_cache[key]
+
+                # foreach updates
+                for group_key, (p_net_data, p_ema_data) in cache['grouped_params'].items():
+                    requires_grad = group_key[0]
+                    if self.trainable_only and not requires_grad:
+                        continue
+                    if runner.iter < self.start_iter:
+                        torch._foreach_copy_(p_ema_data, p_net_data)
+                    else:
+                        self.interp_func(
+                            p_net_data, p_ema_data, trainable=requires_grad, **_interp_cfg, foreach=True)
+
+                for _, (b_net_data, b_ema_data) in cache['grouped_buffers'].items():
+                    torch._foreach_copy_(b_ema_data, b_net_data)
+
+                # fallback updates
+                for p_net, p_ema in cache['fallback_params']:
                     if self.trainable_only and not p_net.requires_grad:
                         continue
                     if runner.iter < self.start_iter:
                         p_ema.data.copy_(p_net.data)
                     else:
-                        p_ema.data.copy_(self.interp_func(
-                            p_net, p_ema, trainable=p_net.requires_grad, **_interp_cfg))
+                        self.interp_func(
+                            p_net.data, p_ema.data, trainable=p_net.requires_grad, **_interp_cfg)
 
-                for b_net, b_ema in zip(net.buffers(), ema.buffers()):
+                for b_net, b_ema in cache['fallback_buffers']:
                     b_ema.data.copy_(b_net.data)
 
     def before_run(self, runner):
@@ -185,3 +245,4 @@ class ExponentialMovingAverageHook(Hook):
             if not rhasattr(model, k):
                 raise RuntimeError(
                     f'Cannot find {k} network for EMA hook.')
+        self._build_module_cache(model)
