@@ -17,7 +17,8 @@ model = dict(
         type='PretrainedDinoV2',
         model_name_or_path='facebook/dinov2-base',
         freeze=True,
-        torch_dtype='bfloat16'),
+        torch_dtype='bfloat16',
+        compile_forward=True),
     diffusion=dict(
         type='GaussianFlow',
         denoising=dict(
@@ -75,6 +76,7 @@ model = dict(
 work_dir = f'work_dirs/{name}'
 train_cfg = dict(
     prob_class=0.9,
+    log_interval=10,  # use this to reduce synchronization overhead due to log collection
 )
 test_cfg = dict()
 
@@ -84,6 +86,7 @@ optimizer = {
         lr=2e-4,
         betas=(0.9, 0.95),
         weight_decay=0.0,
+        fused=True,
     ),
 }
 
@@ -101,12 +104,12 @@ data = dict(
         data_root='data/imagenet/train/',
         datalist_path='data/imagenet/train.txt',
         negative_label=1000,
-        image_size=256,
         latent_size=(3, 256, 256),
         test_label_sampling='equal',  # class-balanced sampling
         test_mode=True),
     val_dataloader=dict(samples_per_gpu=64),
     test_dataloader=dict(samples_per_gpu=64),
+    pin_memory=True,
     persistent_workers=True,
     prefetch_factor=32,
     multiprocessing_context='fork',
@@ -164,7 +167,7 @@ evaluation = [
 
 total_iters = steps_per_epoch * epochs
 log_config = dict(
-    interval=10,
+    interval=100,
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
@@ -190,12 +193,16 @@ runner = dict(
     ckpt_fp16=True,
     ckpt_fp16_ema=True,
     ckpt_bf16_optim=True,
-    gc_interval=100)
+    gc_interval=1000)
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
 resume_from = f'checkpoints/{name}/latest.pth'
 workflow = [('train', save_interval)]
 module_wrapper = 'ddp'
+ddp_kwargs = dict(
+    find_unused_parameters=False,
+    static_graph=True,
+    gradient_as_bucket_view=True)
 cudnn_benchmark = True
 mp_start_method = 'fork'
