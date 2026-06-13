@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.1] - 2026-06-13
+
+### Added
+- AsymFLUX.2 variant models.
+
+### Changed
+- Change default FSDP `buffer_dtype` to `float32`.
+- Introduce various performance optimizations:
+  - Use fused foreach implementation for EMA.
+  - Add `compile_forward` for `PretrainedDinoV2`.
+  - Change `metric_cpu_offload` default to `True`.
+  - Add `log_interval` option to reduce logging synchronization overhead (currently only for `GaussianFlow` and `GMFlow`).
+  - Improve AsymFlow ImageNet training performance.
+
+### Fixed
+- Fix an epoch counter error in saved checkpoints.
+
 ## [0.2.0] - 2026-05-12
 
 ### Added
@@ -14,7 +31,7 @@
 - Update FSDP/DDP wrappers, checkpoint loading/saving, runner utilities, and S3 retry/refresh behavior.
 
 ### Fixed
-- Fixed multiple bugs and edge cases.
+- Fix multiple bugs and edge cases.
 
 ## [0.1.2] - 2026-01-18
 
