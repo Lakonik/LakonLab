@@ -244,6 +244,17 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.pos_embed.proj.bias, 0)
 
+        # Initialize timestep embedding MLP
+        torch.nn.init.normal_(self.emb.timestep_embedder.linear_1.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.emb.timestep_embedder.linear_2.weight, mean=0.0, std=0.02)
+
+        # Upstream DiT initializes one fused qkv Linear with tripled fan-out
+        qkv_init_scale = 2 ** -0.5
+        for block in self.transformer_blocks:
+            block.attn1.to_q.weight.data.mul_(qkv_init_scale)
+            block.attn1.to_k.weight.data.mul_(qkv_init_scale)
+            block.attn1.to_v.weight.data.mul_(qkv_init_scale)
+
         # Zero-out adaLN modulation layers in DiT blocks
         for m in self.modules():
             if isinstance(m, AdaLayerNormZero):
