@@ -29,3 +29,4 @@ build/
 *.pem
 *.env
 .DS_Store
+.claude/
