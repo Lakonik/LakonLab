@@ -16,6 +16,7 @@ class ContinuousTimeStepSampler:
             logit_normal_mean=0.0,
             logit_normal_std=1.0,
             use_dynamic_shifting=False,
+            dynamic_shifting_type='exp',
             base_seq_len=256,
             max_seq_len=4096,
             base_logshift=0.5,
@@ -26,6 +27,7 @@ class ContinuousTimeStepSampler:
         self.logit_normal_mean = logit_normal_mean
         self.logit_normal_std = logit_normal_std
         self.use_dynamic_shifting = use_dynamic_shifting
+        self.dynamic_shifting_type = dynamic_shifting_type
         self.base_seq_len = base_seq_len
         self.max_seq_len = max_seq_len
         self.base_logshift = base_logshift
@@ -33,12 +35,23 @@ class ContinuousTimeStepSampler:
 
     def get_shift(self, seq_len=None):
         if self.use_dynamic_shifting and seq_len is not None:
-            m = (self.max_logshift - self.base_logshift) / (self.max_seq_len - self.base_seq_len)
-            logshift = (seq_len - self.base_seq_len) * m + self.base_logshift
-            if isinstance(logshift, torch.Tensor):
-                shift = torch.exp(logshift)
+            if self.dynamic_shifting_type == 'exp':
+                m = (self.max_logshift - self.base_logshift
+                     ) / (self.max_seq_len - self.base_seq_len)
+                logshift = (seq_len - self.base_seq_len) * m + self.base_logshift
+                if isinstance(logshift, torch.Tensor):
+                    shift = torch.exp(logshift)
+                else:
+                    shift = np.exp(logshift)
+            elif self.dynamic_shifting_type == 'sqrt':
+                max_shift = np.exp(self.max_logshift)
+                base_shift = np.exp(self.base_logshift)
+                sqrt_max_seq_len = np.sqrt(self.max_seq_len)
+                sqrt_base_seq_len = np.sqrt(self.base_seq_len)
+                m = (max_shift - base_shift) / (sqrt_max_seq_len - sqrt_base_seq_len)
+                shift = (np.sqrt(seq_len) - sqrt_base_seq_len) * m + base_shift
             else:
-                shift = np.exp(logshift)
+                raise ValueError(f'Unsupported dynamic_shifting_type [{self.dynamic_shifting_type}].')
         else:
             shift = self.shift
         return shift
