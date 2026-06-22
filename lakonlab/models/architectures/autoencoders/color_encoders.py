@@ -42,13 +42,19 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
     @staticmethod
     def srgb_to_lrgb(srgb):
         a = 0.055
-        return torch.where(srgb <= 0.04045, srgb / 12.92, ((srgb + a) / (1 + a)) ** 2.4)
+        return torch.where(
+            srgb <= 0.04045,
+            srgb / 12.92,
+            ((srgb.clamp(min=0.04045) + a) / (1 + a)) ** 2.4)
 
     @staticmethod
     def lrgb_to_srgb(lrgb):
         lrgb = lrgb.clamp(min=0)
         a = 0.055
-        return torch.where(lrgb <= 0.0031308, lrgb * 12.92, (1 + a) * (lrgb ** (1 / 2.4)) - a)
+        return torch.where(
+            lrgb <= 0.0031308,
+            lrgb * 12.92,
+            (1 + a) * (lrgb.clamp(min=0.0031308) ** (1 / 2.4)) - a)
 
     def lrgb_to_oklab(self, lrgb):
         """
