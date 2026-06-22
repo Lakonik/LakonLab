@@ -114,8 +114,8 @@ class AsymFlowVR(GaussianFlow):
 
         loss = mse_loss
         log_vars = dict(
-            loss_diffusion=float(mse_loss),
-            vr_coef=float(vr_coef.mean())
+            loss_diffusion=mse_loss.detach(),
+            vr_coef=vr_coef.mean()
         )
 
         if self.perceptual_loss is not None:
@@ -135,7 +135,7 @@ class AsymFlowVR(GaussianFlow):
             perceptual_loss = self.perceptual_loss(
                 pred_image, tgt_image, weight=vr_coef_gate * time_weight)
             loss = loss + perceptual_loss
-            log_vars.update(loss_perceptual=float(perceptual_loss))
+            log_vars.update(loss_perceptual=perceptual_loss.detach())
 
         return loss, log_vars
 

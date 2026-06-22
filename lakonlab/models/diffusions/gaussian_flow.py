@@ -208,20 +208,14 @@ class GaussianFlow(nn.Module):
         loss_diffusion = self.loss(denoising_output, x_0, noise, x_t, t)
         loss = loss_diffusion
         log_vars = self.flow_loss.log_vars.copy()
-
-        log_this_step = (
-            running_status is None or
-            running_status['iteration'] % self.train_cfg.get('log_interval', 1) == 0)
-        if log_this_step:
-            log_vars.update(loss_diffusion=float(loss_diffusion.detach()))
+        log_vars.update(loss_diffusion=loss_diffusion.detach())
 
         if use_repa:
             pred_features = self.denoising.get_cache_hidden_states()
             self.denoising.clear_cache()
             loss_align = self.repa_loss(pred_features, visual_encoder_features)
             loss = loss + loss_align
-            if log_this_step:
-                log_vars.update(loss_align=float(loss_align.detach()))
+            log_vars.update(loss_align=loss_align.detach())
 
         return loss, log_vars
 

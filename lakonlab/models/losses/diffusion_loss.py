@@ -162,10 +162,10 @@ class DiffusionLoss(nn.Module):
 
         for idx in range(4):
             if not (quartile == idx).any():
-                loss_quartile = torch.zeros((1, ))
+                loss_quartile = 0
             else:
                 loss_quartile = reduce_loss(loss[quartile == idx], reduction)
-            log_vars[f'{prefix_name}_quartile_{idx}'] = loss_quartile.item()
+            log_vars[f'{prefix_name}_quartile_{idx}'] = loss_quartile
 
         return log_vars
 
@@ -360,8 +360,8 @@ class DiffusionNLLLoss(DiffusionLoss):
                 getattr(self, f'loss_quartile_{idx}').mul_(1 - cur_weight).add_(loss_quartile * cur_weight)
                 getattr(self, f'var_quartile_{idx}').mul_(1 - cur_weight).add_(var_quartile * cur_weight)
 
-            log_vars[f'{prefix_name}_quartile_{idx}'] = getattr(self, f'loss_quartile_{idx}').item()
-            log_vars[f'{prefix_name}_var_quartile_{idx}'] = getattr(self, f'var_quartile_{idx}').item()
+            log_vars[f'{prefix_name}_quartile_{idx}'] = getattr(self, f'loss_quartile_{idx}')
+            log_vars[f'{prefix_name}_var_quartile_{idx}'] = getattr(self, f'var_quartile_{idx}')
 
         return log_vars
 

@@ -137,6 +137,9 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
 
     def train_grad_accum(
             self, train_minibatch_func, data_splits, optimizer, grad_accum_steps, loss_scaler=None, running_status=None):
+        log_this_step = (
+            running_status is None or
+            running_status['iteration'] % self.train_cfg.get('log_interval', 1) == 0)
         log_vars = dict()
         optimizer_modules = [getattr(self, k, None) for k in optimizer.keys()]
 
@@ -146,11 +149,12 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
                     optimizer_modules, enabled=(grad_step_id < grad_accum_steps - 1)):
                 log_vars_single, bs_single = train_minibatch_func(
                     data_splits[grad_step_id], loss_scaler, running_status)
-            for k, v in log_vars_single.items():
-                if k in log_vars:
-                    log_vars[k] += float(v)
-                else:
-                    log_vars[k] = float(v)
+            if log_this_step:
+                for k, v in log_vars_single.items():
+                    if k in log_vars:
+                        log_vars[k] += float(v)
+                    else:
+                        log_vars[k] = float(v)
             bs += bs_single
 
         if grad_accum_steps > 1:

@@ -305,7 +305,7 @@ class PiFlowImitation(PiFlowImitationBase):
             teacher_kwargs)
         loss = loss + loss_diffusion
         log_vars.update(self.flow_loss.log_vars)
-        log_vars.update(loss_diffusion=float(loss_diffusion))
+        log_vars.update(loss_diffusion=loss_diffusion.detach())
 
         return loss, log_vars
 
@@ -380,8 +380,8 @@ class PiFlowImitationDataFree(PiFlowImitationBase):
         loss = loss + loss_diffusion
         log_vars.update({k: v * segment_size for k, v in self.flow_loss.log_vars.items()})
         log_vars.update({
-            'loss_diffusion': float(loss_diffusion),
-            f'loss_diffusion_step{step_id}': float(step_loss_diffusion)
+            'loss_diffusion': loss_diffusion.detach(),
+            f'loss_diffusion_step{step_id}': step_loss_diffusion.detach()
         })
 
         if step_id < nfe - 1:

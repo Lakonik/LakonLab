@@ -430,19 +430,13 @@ class GMFlow(GMFlowMixin, GaussianFlow):
         denoising_output = self.pred(x_t_high, t_high, **kwargs)
         loss = self.loss(denoising_output, x_t_low, x_t_high, t_low, t_high)
         log_vars = self.flow_loss.log_vars.copy()
-
-        log_this_step = (
-            running_status is None or
-            running_status['iteration'] % self.train_cfg.get('log_interval', 1) == 0)
-        if log_this_step:
-            log_vars.update(loss_transition=float(loss.detach()))
+        log_vars.update(loss_transition=loss.detach())
 
         if self.spectrum_net is not None:
             # Note: only support 2D power spectrum for now.
             loss_spectral = self.spectral_loss(denoising_output, x_0, x_t_high, t_high)
             loss = loss + loss_spectral
-            if log_this_step:
-                log_vars.update(loss_spectral=float(loss_spectral.detach()))
+            log_vars.update(loss_spectral=loss_spectral.detach())
 
         return loss, log_vars
 
