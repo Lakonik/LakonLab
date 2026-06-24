@@ -456,7 +456,10 @@ def resize_and_crop(image: Image, target_hw: tuple[int, int]):
 def load_image(filepath, file_client, target_size=None):
     img_bytes = file_client.get(filepath)
     extension = os.path.splitext(filepath)[-1].lower()
-    arr = imageio.v3.imread(BytesIO(img_bytes), extension=extension)  # (H,W,C) or (H,W)
+    if extension in ('.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.ogv'):
+        arr = imageio.v3.imread(BytesIO(img_bytes), extension=extension)
+    else:
+        arr = imageio.v3.imread(BytesIO(img_bytes), extension=extension, mode='RGB')
     if arr.ndim == 2:  # grayscale -> RGB
         arr = np.stack([arr, arr, arr], axis=-1)
     if arr.shape[-1] == 4:  # RGBA -> RGB

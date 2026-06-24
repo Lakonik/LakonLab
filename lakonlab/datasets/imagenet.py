@@ -193,7 +193,7 @@ class ImageNet(Dataset):
                 label = torch.as_tensor(torch_data['y'], dtype=torch.long)
                 if self.ignore_cached_latents:
                     assert 'image_bytes' in torch_data
-                    img_data = Image.open(BytesIO(torch_data['image_bytes']))
+                    img_data = Image.open(BytesIO(torch_data['image_bytes'])).convert('RGB')
                     data.update(
                         images=torch.from_numpy(image_preproc(
                             img_data, self.image_size, random_flip=self.random_flip
@@ -207,7 +207,7 @@ class ImageNet(Dataset):
                         data.update(latents=torch_data['x'].float())
                     if 'image_bytes' in torch_data:
                         assert not self.random_flip
-                        img_data = Image.open(BytesIO(torch_data['image_bytes']))
+                        img_data = Image.open(BytesIO(torch_data['image_bytes'])).convert('RGB')
                         data.update(
                             images=torch.from_numpy(image_preproc(
                                 img_data, self.image_size, random_flip=self.random_flip
@@ -216,7 +216,7 @@ class ImageNet(Dataset):
                 label = torch.tensor(self.all_labels[idx], dtype=torch.long)
                 if self.return_image_bytes:
                     data.update(image_bytes=DC(data_bytes, cpu_only=True))
-                img_data = Image.open(data_bytesio)
+                img_data = Image.open(data_bytesio).convert('RGB')
                 data.update(
                     images=torch.from_numpy(image_preproc(
                         img_data, self.image_size, random_flip=self.random_flip
