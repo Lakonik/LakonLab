@@ -89,7 +89,6 @@ for step, substep in [(8, 16), (32, 4)]:
                         dict(
                             type='InceptionMetrics',
                             num_images=50000,
-                            resize=False,
                             reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl'),
                     ],
                     viz_dir=f'viz/{name}/{prefix}',

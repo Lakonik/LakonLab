@@ -144,7 +144,7 @@ evaluation = [
                 type='InceptionMetrics',
                 num_images=50000,
                 reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl',
-                resize=False),
+            ),
         ],
         save_best_ckpt=False,
         # viz_num=256,

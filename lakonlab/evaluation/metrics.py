@@ -314,8 +314,6 @@ class InceptionMetrics(Metric):
                  reference_pkl=None,
                  bgr2rgb=False,
                  center_crop=False,  # SDXL-Lightning patch FID
-                 resize=True,
-                 resize_mode='bicubic',
                  inception_args=dict(
                     type='StyleGAN',
                     inception_path=TERO_INCEPTION_URL),
@@ -339,14 +337,7 @@ class InceptionMetrics(Metric):
         self.real_cov = None
         self.bgr2rgb = bgr2rgb
         self.center_crop = center_crop
-        self.resize = resize
-        self.resize_mode = resize_mode
         self.device = 'cpu'
-
-        if self.center_crop and self.resize:
-            warnings.warn('`center_crop` is set to True, `resize` will be ignored.')
-        if self.resize_mode not in ('bicubic', 'bilinear'):
-            raise ValueError(f'Unsupported resize_mode: {self.resize_mode}')
 
         logger = get_root_logger()
         ori_level = logger.level
@@ -521,10 +512,6 @@ class InceptionMetrics(Metric):
             h_offset = (h - crop_size) // 2
             w_offset = (w - crop_size) // 2
             batch = batch[:, :, h_offset:h_offset + crop_size, w_offset:w_offset + crop_size]
-        elif self.resize:
-            batch = F.interpolate(
-                batch, size=(299, 299), mode=self.resize_mode,
-                align_corners=False, antialias=self.resize_mode == 'bicubic').clamp(min=-1, max=1)
         assert self.inception_style == 'StyleGAN'
         batch = (batch * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         feat = self.inception_net(batch, return_features=True)

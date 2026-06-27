@@ -70,7 +70,6 @@ for temperature in [0.3]:
                 dict(
                     type='InceptionMetrics',
                     num_images=num_images,
-                    resize=True,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -79,7 +78,6 @@ for temperature in [0.3]:
                     type='InceptionMetrics',
                     num_images=num_images,
                     center_crop=True,
-                    resize=False,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -92,7 +90,6 @@ for temperature in [0.3]:
                 dict(
                     type='InceptionMetrics',
                     num_images=num_images,
-                    resize=True,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -101,7 +98,6 @@ for temperature in [0.3]:
                     type='InceptionMetrics',
                     num_images=num_images,
                     center_crop=True,
-                    resize=False,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,

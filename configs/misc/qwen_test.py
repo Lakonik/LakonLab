@@ -68,7 +68,6 @@ for method_name, method_config in methods.items():
                 dict(
                     type='InceptionMetrics',
                     num_images=num_images,
-                    resize=True,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -77,7 +76,6 @@ for method_name, method_config in methods.items():
                     type='InceptionMetrics',
                     num_images=num_images,
                     center_crop=True,
-                    resize=False,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -90,7 +88,6 @@ for method_name, method_config in methods.items():
                 dict(
                     type='InceptionMetrics',
                     num_images=num_images,
-                    resize=True,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -99,7 +96,6 @@ for method_name, method_config in methods.items():
                     type='InceptionMetrics',
                     num_images=num_images,
                     center_crop=True,
-                    resize=False,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,

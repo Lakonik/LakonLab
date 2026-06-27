@@ -65,7 +65,6 @@ for step in steps:
                 dict(
                     type='InceptionMetrics',
                     num_images=num_images,
-                    resize=True,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -74,7 +73,6 @@ for step in steps:
                     type='InceptionMetrics',
                     num_images=num_images,
                     center_crop=True,
-                    resize=False,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -87,7 +85,6 @@ for step in steps:
                 dict(
                     type='InceptionMetrics',
                     num_images=num_images,
-                    resize=True,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
@@ -96,7 +93,6 @@ for step in steps:
                     type='InceptionMetrics',
                     num_images=num_images,
                     center_crop=True,
-                    resize=False,
                     use_kid=False,
                     use_pr=False,
                     use_is=False,
