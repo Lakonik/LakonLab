@@ -36,7 +36,7 @@ def train_model(model,
         module_wrapper = cfg.get('module_wrapper', None)
         model = apply_module_wrapper(model, module_wrapper, cfg)
     else:
-        model = MMDataParallel(model, device_ids=cfg.gpu_ids)
+        model = MMDataParallel(model, device_ids=[0])
 
     # build optimizer
     if cfg.optimizer:

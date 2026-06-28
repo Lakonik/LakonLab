@@ -48,24 +48,6 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi', 'flyte'],
         default='none',
         help='job launcher')
-    group_gpus = parser.add_mutually_exclusive_group()
-    group_gpus.add_argument(
-        '--gpus',
-        type=int,
-        help='number of gpus to use '
-             '(only applicable to non-distributed testing)')
-    group_gpus.add_argument(
-        '--gpu-ids',
-        type=int,
-        nargs='+',
-        help='(Deprecated, please use --gpu-id) ids of gpus to use '
-             '(only applicable to non-distributed testing)')
-    group_gpus.add_argument(
-        '--gpu-id',
-        type=int,
-        default=0,
-        help='id of gpu to use '
-             '(only applicable to non-distributed testing)')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
     parser.add_argument(
         '--diff_seed',
@@ -155,15 +137,6 @@ def main():
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
 
-    if args.gpu_ids is not None:
-        cfg.gpu_ids = args.gpu_ids[0:1]
-        warnings.warn('`--gpu-ids` is deprecated, please use `--gpu-id`. '
-                      'Because we only support single GPU mode in '
-                      'non-distributed testing. Use the first GPU '
-                      'in `gpu_ids` now.')
-    else:
-        cfg.gpu_ids = [args.gpu_id]
-
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         distributed = False
@@ -173,7 +146,6 @@ def main():
         if args.launcher != 'flyte':  # flyte launcher already sets up the distributed environment
             init_dist(args.launcher, **cfg.dist_params)
         rank, world_size = get_dist_info()
-        cfg.gpu_ids = range(world_size)
 
     log_path = None
     ckpt_name = None
