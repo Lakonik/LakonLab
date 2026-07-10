@@ -43,6 +43,11 @@ S3_TRANSFER_CONFIG = TransferConfig(
 LAKONLAB_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache', 'lakonlab')
 AWS_SHARED_CREDENTIALS_FILE = os.path.join(os.path.expanduser('~'), '.aws', 'credentials')
 
+HF_REPO_TYPES = {
+    'datasets': 'dataset',
+    'spaces': 'space'
+}
+
 
 def retry(tries=5, delay=3, exceptions=(Exception,)):
     def decorator(func):
@@ -126,10 +131,14 @@ def download_from_url(url,
 
 @retry()
 def download_from_huggingface(filename):
-    filename = filename.replace('huggingface://', '').split('/')
+    filename = filename.removeprefix('huggingface://').split('/')
+    repo_type = None
+    if filename[0] in HF_REPO_TYPES:
+        repo_type = HF_REPO_TYPES[filename[0]]
+        filename = filename[1:]
     repo_id = '/'.join(filename[:2])
     repo_filename = '/'.join(filename[2:])
-    cached_file = hf_hub_download(repo_id=repo_id, filename=repo_filename)
+    cached_file = hf_hub_download(repo_id=repo_id, filename=repo_filename, repo_type=repo_type)
     return cached_file
 
 
