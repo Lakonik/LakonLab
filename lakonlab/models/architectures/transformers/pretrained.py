@@ -32,6 +32,7 @@ class PretrainedDinoV2(nn.Module):
         self.eval_mode = eval_mode
         self.register_buffer('mean', torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
         self.register_buffer('std', torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
+        self.resize_position_embeddings()
         if self.freeze:
             self.requires_grad_(False)
         if self.eval_mode:
@@ -52,6 +53,29 @@ class PretrainedDinoV2(nn.Module):
         mode = mode and (not self.eval_mode)
         return super().train(mode)
 
+    def resize_position_embeddings(self):
+        position_embeddings = self.model.embeddings.position_embeddings
+        num_positions = position_embeddings.shape[1] - 1
+        new_size = self.image_size // self.model.config.patch_size
+        if num_positions == new_size * new_size:
+            return
+
+        class_pos_embed = position_embeddings[:, :1]
+        patch_pos_embed = position_embeddings[:, 1:]
+        old_size = int(num_positions ** 0.5)
+        dim = patch_pos_embed.shape[-1]
+        target_dtype = patch_pos_embed.dtype
+        patch_pos_embed = patch_pos_embed.reshape(1, old_size, old_size, dim).permute(0, 3, 1, 2)
+        patch_pos_embed = F.interpolate(
+            patch_pos_embed.float(),
+            size=(new_size, new_size),
+            mode='bicubic',
+            antialias=True  # REPA uses antialiasing in timm.layers.pos_embed.resample_abs_pos_embed
+        ).to(dtype=target_dtype)
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).reshape(1, -1, dim)
+        self.model.embeddings.position_embeddings = nn.Parameter(
+            torch.cat((class_pos_embed, patch_pos_embed), dim=1))
+
     def preprocess(self, images):
         images = images.float()
         if images.shape[-2:] != (self.image_size, self.image_size):
@@ -65,14 +89,14 @@ class PretrainedDinoV2(nn.Module):
         images = (images - self.mean) / self.std
         return images
 
-    def _forward_impl(self, pixel_values):
+    def _forward_impl(self, images):
+        pixel_values = self.preprocess(images).to(self.dtype)
         outputs = self.model(pixel_values=pixel_values, return_dict=True)
         hidden_states = outputs.last_hidden_state
         num_register_tokens = getattr(self.model.config, 'num_register_tokens', 0)
         return hidden_states[:, 1 + num_register_tokens:]
 
     def forward(self, images):
-        pixel_values = self.preprocess(images).to(self.dtype)
         if self._compiled_forward is not None:
-            return self._compiled_forward(pixel_values).clone()
-        return self._forward_impl(pixel_values)
+            return self._compiled_forward(images).clone()
+        return self._forward_impl(images)
