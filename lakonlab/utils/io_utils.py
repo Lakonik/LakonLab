@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Hansheng Chen
 
 import os
+import hashlib
 import shutil
 import time
 import mimetypes
 import tempfile
-import uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -40,13 +40,17 @@ S3_TRANSFER_CONFIG = TransferConfig(
     multipart_chunksize=S3_MULTIPART_CHUNKSIZE,
 )
 
-LAKONLAB_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.cache', 'lakonlab')
+LAKONLAB_CACHE = os.getenv('LAKONLAB_CACHE', os.path.join(os.path.expanduser('~'), '.cache', 'lakonlab'))
 AWS_SHARED_CREDENTIALS_FILE = os.path.join(os.path.expanduser('~'), '.aws', 'credentials')
 
 HF_REPO_TYPES = {
     'datasets': 'dataset',
     'spaces': 'space'
 }
+
+
+class _S3ObjectChangedError(RuntimeError):
+    pass
 
 
 def retry(tries=5, delay=3, exceptions=(Exception,)):
@@ -80,12 +84,15 @@ def _download_from_url(url, dest_path, hash_prefix):
 
 
 @contextmanager
-def locked_cache_path(path):
+def locked_cache_path(path, expected_size=None):
     path = str(path)
     with WeakFileLock(f'{path}.lock'):
         if os.path.exists(path):
-            yield path, True
-            return
+            if (expected_size is None
+                    or os.path.getsize(path) == expected_size):
+                yield path, True
+                return
+            os.remove(path)
 
         tmp_path = f'{path}.tmp.{os.getpid()}'
         if os.path.isdir(tmp_path):
@@ -104,10 +111,13 @@ def locked_cache_path(path):
 
 def download_from_url(url,
                       dest_path=None,
-                      dest_dir=LAKONLAB_CACHE_DIR,
+                      dest_dir=None,
                       hash_prefix=None):
     """Modified from MMGeneration.
     """
+    if dest_dir is None:
+        dest_dir = os.path.join(LAKONLAB_CACHE, 'downloads')
+
     # get the exact destination path
     if dest_path is None:
         filename = url.split('/')[-1]
@@ -351,20 +361,52 @@ class S3Backend(BaseStorageBackend):
             ExtraArgs=extra_args,
         )
 
+    @retry()
+    @_refresh_s3_client
+    def _head_object(self, filepath: Union[str, Path]) -> dict:
+        filepath = str(filepath)
+        bucket, prefix = self._split_s3_url(filepath)
+        return self._client.head_object(Bucket=bucket, Key=prefix)
+
+    # Retry if the S3 object is overwritten between the initial HEAD and the
+    # download, so new contents are not cached under the previous ETag.
+    @retry(exceptions=(_S3ObjectChangedError,))
+    def _get_cached_file(self, filepath: Union[str, Path]) -> str:
+        filepath = str(filepath)
+        filepath_hash = hashlib.sha256(filepath.encode()).hexdigest()
+        suffix = os.path.splitext(filepath)[-1]
+
+        metadata = self._head_object(filepath)
+        etag = metadata['ETag']
+        content_length = metadata['ContentLength']
+        revision = hashlib.sha256(
+            f'{etag}:{content_length}'.encode()).hexdigest()
+        cache_dir = os.path.join(
+            LAKONLAB_CACHE, 's3', filepath_hash)
+        cached_file = os.path.join(cache_dir, revision + suffix)
+        mmcv.mkdir_or_exist(cache_dir)
+
+        with locked_cache_path(
+                cached_file, expected_size=content_length) as (local_path, exists):
+            if not exists:
+                self.download_file(filepath, local_path)
+                current_metadata = self._head_object(filepath)
+                if (current_metadata['ETag'] != etag
+                        or current_metadata['ContentLength'] != content_length):
+                    raise _S3ObjectChangedError(
+                        f'S3 object changed while downloading: {filepath}')
+                if os.path.getsize(local_path) != content_length:
+                    raise IOError(
+                        f'Downloaded file size does not match S3 '
+                        f'object: {filepath}')
+
+        return cached_file
+
     @contextmanager
     def get_local_path(
             self,
             filepath: Union[str, Path]) -> Generator[Union[str, Path], None, None]:
-        assert self.isfile(filepath)
-        cached_file = None
-        try:
-            filepath = str(filepath)
-            cached_file = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()) + os.path.splitext(filepath)[-1])
-            self.download_file(filepath, cached_file)
-            yield cached_file
-        finally:
-            if cached_file is not None and os.path.exists(cached_file):
-                os.remove(cached_file)
+        yield self._get_cached_file(filepath)
 
     @retry()
     @_refresh_s3_client
@@ -422,10 +464,7 @@ class HuggingFaceBackend(BaseStorageBackend):
 
     @contextmanager
     def get_local_path(self, filepath: str):
-        try:
-            yield download_from_huggingface(filepath)
-        finally:
-            pass
+        yield download_from_huggingface(filepath)
 
 
 FileClient.register_backend(name='s3', backend=S3Backend, force=True, prefixes='s3')
