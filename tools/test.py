@@ -17,6 +17,13 @@ import re
 from copy import deepcopy
 
 import torch
+from torch._inductor import config as torch_inductor_config
+
+# torch 2.11's slow cudagraph pool assertion snapshots storage liveness
+# before its internal gc.collect(), then compares against allocator state
+# after collection, which can report already-dead storages as phantom leaks.
+if torch.__version__.startswith('2.11.'):
+    torch_inductor_config.triton.slow_path_cudagraph_asserts = False
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
