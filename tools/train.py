@@ -210,8 +210,6 @@ def main():
 
     # default loader config
     loader_cfg = dict(
-        # cfg.gpus will be ignored if distributed
-        num_gpus=len(cfg.gpu_ids),
         seed=cfg.seed)
 
     # The overall dataloader settings

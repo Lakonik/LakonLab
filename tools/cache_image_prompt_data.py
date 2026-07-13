@@ -287,7 +287,6 @@ def main():
         if len(dataset) > 0:
             # The default loader config
             loader_cfg = dict(
-                num_gpus=len(cfg.gpu_ids),
                 shuffle=False)
             # The overall dataloader settings
             loader_cfg.update({

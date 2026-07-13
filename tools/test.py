@@ -187,7 +187,6 @@ def main():
     # The default loader config
     loader_cfg = dict(
         workers_per_gpu=cfg.data.get('val_workers_per_gpu', cfg.data.workers_per_gpu),
-        num_gpus=len(cfg.gpu_ids),
         shuffle=False)
 
     # The overall dataloader settings
