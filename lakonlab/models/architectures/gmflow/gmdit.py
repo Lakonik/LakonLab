@@ -218,7 +218,7 @@ class GMDiTTransformer2DModel(_GMDiTTransformer2DModel):
             torch_dtype='float32',
             autocast_dtype=None,
             freeze_exclude_fp32=True,
-            freeze_exclude_autocast_dtype='float32',
+            freeze_exclude_autocast_dtype=None,
             checkpointing=True,
             **kwargs):
         super().__init__(*args, **kwargs)

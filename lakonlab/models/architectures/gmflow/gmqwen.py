@@ -224,7 +224,7 @@ class GMQwenImageTransformer2DModel(_GMQwenImageTransformer2DModel):
             torch_dtype='float32',
             autocast_dtype=None,
             freeze_exclude_fp32=True,
-            freeze_exclude_autocast_dtype='float32',
+            freeze_exclude_autocast_dtype=None,
             checkpointing=True,
             use_lora=False,
             lora_target_modules=None,

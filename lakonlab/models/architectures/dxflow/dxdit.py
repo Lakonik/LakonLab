@@ -24,7 +24,7 @@ class DXDiTTransformer2DModel(_DiTTransformer2DModelMod):
             torch_dtype='float32',
             autocast_dtype=None,
             freeze_exclude_fp32=True,
-            freeze_exclude_autocast_dtype='float32',
+            freeze_exclude_autocast_dtype=None,
             checkpointing=True,
             **kwargs):
         out_channels = out_channels or in_channels

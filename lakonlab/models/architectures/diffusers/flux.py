@@ -28,7 +28,7 @@ class FluxTransformer2DModel(_FluxTransformer2DModel):
             pretrained_lora_scale=1.0,
             torch_dtype='float32',
             freeze_exclude_fp32=True,
-            freeze_exclude_autocast_dtype='float32',
+            freeze_exclude_autocast_dtype=None,
             checkpointing=True,
             use_lora=False,
             lora_target_modules=None,

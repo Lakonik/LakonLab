@@ -374,7 +374,7 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
                 dynamic=False),
             autocast_dtype=None,
             freeze_exclude_fp32=True,
-            freeze_exclude_autocast_dtype='float32',
+            freeze_exclude_autocast_dtype=None,
             checkpointing=True,
             **kwargs):
         super().__init__(*args, **kwargs)

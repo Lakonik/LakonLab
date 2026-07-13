@@ -17,7 +17,7 @@ def autocast_patch(module, dtype=None, enabled=True):
     module.forward = make_new_forward(module.forward, dtype, enabled)
 
 
-def flex_freeze(module, exclude_keys=None, exclude_fp32=True, exclude_autocast_dtype='float32'):
+def flex_freeze(module, exclude_keys=None, exclude_fp32=True, exclude_autocast_dtype=None):
     module.requires_grad_(False)
 
     if exclude_keys is not None and len(exclude_keys) > 0:
@@ -43,7 +43,8 @@ def flex_freeze(module, exclude_keys=None, exclude_fp32=True, exclude_autocast_d
             m = rgetattr(module, name)
             if exclude_fp32:
                 m.to(torch.float32)
-                autocast_patch(m, dtype=getattr(torch, exclude_autocast_dtype))
+                if exclude_autocast_dtype is not None:
+                    autocast_patch(m, dtype=getattr(torch, exclude_autocast_dtype))
             m.requires_grad_(True)
 
         exclude_keys = set(exclude_keys) - excluded_module_keys
