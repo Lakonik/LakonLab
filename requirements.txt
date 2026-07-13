@@ -18,3 +18,4 @@ gradio==5.49.0
 datasets
 boto3
 lpips
+webdataset
