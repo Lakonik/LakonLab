@@ -120,6 +120,14 @@ def main():
         **dataloader_kwargs,
     )
     encoder = build_module(cfg.model.vae).to(device).eval()
+    if hasattr(cfg.model, 'vae_2'):
+        encoder_2 = build_module(cfg.model.vae_2).to(device).eval()
+        if hasattr(encoder_2, 'dtype'):
+            encoder_2_dtype = encoder_2.dtype
+        else:
+            encoder_2_dtype = next(encoder_2.parameters()).dtype
+    else:
+        encoder_2 = None
 
     cross_gram = None
     pixel_gram = None
@@ -131,8 +139,12 @@ def main():
         if num_seen >= args.num_images:
             break
 
-        latents = data['latents'].to(device=device, dtype=torch.float32)
         images = data['images'].to(device=device, dtype=torch.float32)
+        if 'latents' in data:
+            latents = data['latents'].to(device=device, dtype=torch.float32)
+        else:
+            assert encoder_2 is not None
+            latents = encoder_2.encode((images * 2 - 1).to(encoder_2_dtype)).float()
         remaining = args.num_images - num_seen
         if latents.size(0) > remaining:
             latents = latents[:remaining]

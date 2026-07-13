@@ -8,12 +8,13 @@ from mmcv import Config, DictAction
 from tqdm import tqdm
 
 from lakonlab.datasets import build_dataset, build_dataloader
+from lakonlab.models import build_module
 from lakonlab.runner.checkpoint import write_checkpoint_to_file
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Create a patch PCA subspace for pixel AsymFlow models using DiT patch convention (channel last).')
+        description='Create a patch PCA subspace for AsymFlow models using the configured encoder and DiT patch convention (channel last).')
     parser.add_argument('config', help='AsymFlow ImageNet training config file.')
     parser.add_argument('--out', help='Output checkpoint path. Defaults to `pretrained_linear_proj` in the config.')
     parser.add_argument('--num-images', type=int, default=10000)
@@ -30,11 +31,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def patchify_dit_pixels(images, patch_size: int):
-    bs, c, h, w = images.shape
+def patchify_dit(latents, patch_size: int):
+    bs, c, h, w = latents.shape
     if h % patch_size != 0 or w % patch_size != 0:
-        raise ValueError(f'Image size {(h, w)} is not divisible by patch size {patch_size}.')
-    return images.reshape(
+        raise ValueError(f'Latent size {(h, w)} is not divisible by patch size {patch_size}.')
+    return latents.reshape(
         bs, c, h // patch_size, patch_size, w // patch_size, patch_size
     ).permute(
         0, 3, 5, 1, 2, 4
@@ -42,7 +43,7 @@ def patchify_dit_pixels(images, patch_size: int):
         bs, patch_size * patch_size * c, h // patch_size, w // patch_size)
 
 
-def compute_pixel_gram(cfg, args, patch_size, device):
+def compute_latent_gram(cfg, args, patch_size, device):
     dataset_cfg = deepcopy(cfg.data.train)
     dataset = build_dataset(dataset_cfg)
     batch_size = args.batch_size or cfg.data.train_dataloader.get('samples_per_gpu', 1)
@@ -61,8 +62,13 @@ def compute_pixel_gram(cfg, args, patch_size, device):
         workers,
         **dataloader_kwargs,
     )
+    encoder = build_module(cfg.model.vae).to(device).eval()
+    if hasattr(encoder, 'dtype'):
+        encoder_dtype = encoder.dtype
+    else:
+        encoder_dtype = next(encoder.parameters()).dtype
 
-    pixel_gram = None
+    latent_gram = None
     num_seen = 0
     progress = tqdm(total=min(args.num_images, len(dataset)), disable=args.no_progress)
 
@@ -70,25 +76,34 @@ def compute_pixel_gram(cfg, args, patch_size, device):
         if num_seen >= args.num_images:
             break
 
-        images = data['images'].to(device=device, dtype=torch.float32)
         remaining = args.num_images - num_seen
-        if images.size(0) > remaining:
-            images = images[:remaining]
 
-        patches = patchify_dit_pixels(images * 2 - 1, patch_size)
+        if 'latents' in data:
+            latents = data['latents'].to(device=device, dtype=torch.float32)
+        elif 'images' in data:
+            images = data['images'].to(device=device, dtype=torch.float32)
+            latents = encoder.encode((images * 2 - 1).to(encoder_dtype)).float()
+        else:
+            raise KeyError(
+                'Dataset batch contains neither `latents` nor `images`; cannot build PCA samples.')
+
+        if latents.size(0) > remaining:
+            latents = latents[:remaining]
+
+        patches = patchify_dit(latents, patch_size)
         patches = patches.permute(0, 2, 3, 1).reshape(-1, patches.size(1)).double()
 
-        if pixel_gram is None:
+        if latent_gram is None:
             dim = patches.size(1)
-            pixel_gram = torch.zeros((dim, dim), dtype=torch.float64, device=device)
-        pixel_gram += patches.T @ patches
-        num_seen += images.size(0)
-        progress.update(images.size(0))
+            latent_gram = torch.zeros((dim, dim), dtype=torch.float64, device=device)
+        latent_gram += patches.T @ patches
+        num_seen += latents.size(0)
+        progress.update(latents.size(0))
     progress.close()
 
-    if pixel_gram is None:
+    if latent_gram is None:
         raise RuntimeError('No images were processed.')
-    return pixel_gram
+    return latent_gram
 
 
 def main():
@@ -111,12 +126,12 @@ def main():
             'pretrained_linear_proj', 'checkpoints/asymflow_subspace_pca_dit.pth')
 
     torch.set_grad_enabled(False)
-    pixel_gram = compute_pixel_gram(cfg, args, patch_size, device)
-    dim = pixel_gram.size(0)
+    latent_gram = compute_latent_gram(cfg, args, patch_size, device)
+    dim = latent_gram.size(0)
     if rank > dim:
         raise ValueError(f'Rank {rank} exceeds patch dimension {dim}.')
 
-    _, evecs = torch.linalg.eigh(pixel_gram)
+    _, evecs = torch.linalg.eigh(latent_gram)
     proj_mat = evecs[:, -rank:].contiguous().float().cpu()
 
     write_checkpoint_to_file({f'proj_mat_p{patch_size}': proj_mat}, out)
