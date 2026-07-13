@@ -63,12 +63,12 @@ class AsymFlowVR(GaussianFlow):
         sigma_clamped = sigma.clamp(min=self.sigma_min)
 
         # AsymFlowVR data preparation
-        proj_mat = self.denoising.proj_buffer.to(dtype=dtype)  # (full_rank, base_rank)
+        proj_mat = self.denoising.proj_buffer.to(dtype=dtype)  # (full_rank, basis_rank)
         s = self.denoising.scale_buffer.to(dtype=dtype)
 
         latents_patchified = self.denoising.patchify(latents_2, self.latent_patch_size)
         latents_patchified_shape = latents_patchified.shape[2:]  # (h, w) or (t, h, w)
-        # (bs, n, base_rank)
+        # (bs, n, basis_rank)
         latents_packed = self.denoising.pack(latents_patchified)
 
         x_0_low_rank_packed = latents_packed @ (proj_mat.T * s)  # (bs, n, full_rank)

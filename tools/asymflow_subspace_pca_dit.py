@@ -118,7 +118,7 @@ def main():
 
     denoising_cfg = cfg.model.diffusion.denoising
     patch_size = denoising_cfg.patch_size
-    rank = denoising_cfg.base_rank
+    rank = denoising_cfg.basis_rank
 
     out = args.out
     if out is None:

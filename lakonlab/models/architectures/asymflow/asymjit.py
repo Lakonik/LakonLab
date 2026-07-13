@@ -17,7 +17,7 @@ class AsymJiT(AsymFlowMixin, _JiT):
             *args,
             patch_size: int = 16,
             in_channels: int = 3,
-            base_rank: int = 32,
+            basis_rank: int = 32,
             sigma_min: float = 1e-4,
             num_timesteps=1,
             freeze=False,
@@ -40,10 +40,10 @@ class AsymJiT(AsymFlowMixin, _JiT):
             in_channels=in_channels,
             **kwargs)
 
-        self.base_rank = base_rank
+        self.basis_rank = basis_rank
         self.num_timesteps = num_timesteps
         self.sigma_min = sigma_min
-        self.init_asymflow_buffers(in_channels * (patch_size ** 2), base_rank)
+        self.init_asymflow_buffers(in_channels * (patch_size ** 2), basis_rank)
 
         self.init_weights(pretrained, pretrained_linear_proj)
 
@@ -94,22 +94,22 @@ class AsymJiT(AsymFlowMixin, _JiT):
 
     def _init_projected_bottleneck(self, proj_mat):
         # JiT's first conv is the actual patch-to-bottleneck projection.  Keep
-        # the original scratch init, but reserve the first base_rank channels
+        # the original scratch init, but reserve the first basis_rank channels
         # for the low-rank basis used by the analytic output term.
         p = self.patch_size
         patch_dim = self.in_channels * (p ** 2)
-        expected_shape = (patch_dim, self.base_rank)
+        expected_shape = (patch_dim, self.basis_rank)
         if tuple(proj_mat.shape) != expected_shape:
             raise RuntimeError(
                 f'proj_mat shape mismatch: expected {expected_shape}, got {tuple(proj_mat.shape)}.')
-        if self.x_embedder.proj1.out_channels < self.base_rank:
+        if self.x_embedder.proj1.out_channels < self.basis_rank:
             raise RuntimeError(
-                f'JiT bottleneck_dim must be >= base_rank, got '
-                f'{self.x_embedder.proj1.out_channels} and {self.base_rank}.')
+                f'JiT bottleneck_dim must be >= basis_rank, got '
+                f'{self.x_embedder.proj1.out_channels} and {self.basis_rank}.')
 
         proj1_weight = self.x_embedder.proj1.weight
         proj1_basis = proj_mat.T.reshape(
-            self.base_rank, p, p, self.in_channels
+            self.basis_rank, p, p, self.in_channels
         ).permute(
             0, 3, 1, 2
         )
@@ -117,7 +117,7 @@ class AsymJiT(AsymFlowMixin, _JiT):
         init_gain = (2 * patch_dim / (patch_dim + self.x_embedder.proj1.out_channels)) ** 0.5
         proj1_basis = proj1_basis.mul(init_gain).to(dtype=proj1_weight.dtype, device=proj1_weight.device)
 
-        proj1_weight.data[:self.base_rank].copy_(proj1_basis)
+        proj1_weight.data[:self.basis_rank].copy_(proj1_basis)
 
     @staticmethod
     def patchify(latents, patch_size, pack_channels=True):

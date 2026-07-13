@@ -29,7 +29,7 @@ class _AsymFlux2Transformer2DModel(AsymFlowMixin, Flux2Transformer2DModel):
             self,
             patch_size=16,
             in_channels: int = 3,
-            base_rank: int = 128,
+            basis_rank: int = 128,
             num_layers: int = 8,
             num_single_layers: int = 48,
             attention_head_dim: int = 128,
@@ -113,10 +113,10 @@ class _AsymFlux2Transformer2DModel(AsymFlowMixin, Flux2Transformer2DModel):
         )
 
         # 8. AsymFlow attributes and buffers
-        self.base_rank = base_rank
+        self.basis_rank = basis_rank
         self.sigma_min = sigma_min
         self.num_timesteps = num_timesteps
-        self.init_asymflow_buffers(self.in_channels * (patch_size ** 2), self.base_rank)
+        self.init_asymflow_buffers(self.in_channels * (patch_size ** 2), self.basis_rank)
 
         self.gradient_checkpointing = False
 
@@ -395,12 +395,12 @@ class AsymFlux2Transformer2DModel(_AsymFlux2Transformer2DModel):
                 pretrained_linear_proj, map_location='cpu', logger=logger)
             dtype = state_dict['x_embedder.weight'].dtype
             p = self.patch_size
-            proj_mat = linear_proj_state_dict[f'proj_mat_p{p}']  # (in_channels * p2, base_rank)
+            proj_mat = linear_proj_state_dict[f'proj_mat_p{p}']  # (in_channels * p2, basis_rank)
             if 'x_embedder.weight' in state_dict:
-                in_proj_weight = proj_mat.T.to(dtype)  # (base_rank, in_channels * p2)
+                in_proj_weight = proj_mat.T.to(dtype)  # (basis_rank, in_channels * p2)
                 state_dict['x_embedder.weight'] = state_dict['x_embedder.weight'] @ in_proj_weight
             if 'proj_out.weight' in state_dict:
-                out_proj_weight = proj_mat.to(dtype)  # (in_channels * p2, base_rank)
+                out_proj_weight = proj_mat.to(dtype)  # (in_channels * p2, basis_rank)
                 state_dict['proj_out.weight'] = out_proj_weight @ state_dict['proj_out.weight']
             state_dict['proj_buffer'] = proj_mat
             if f'scale_p{p}' in linear_proj_state_dict:

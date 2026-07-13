@@ -17,10 +17,10 @@ class AsymFlowMixin:
 
     train_sigma_min = 1e-6
 
-    def init_asymflow_buffers(self, patch_dim: int, base_rank: int):
-        assert patch_dim >= base_rank
-        eye = torch.eye(base_rank)
-        self.register_buffer('proj_buffer', F.pad(eye, (0, 0, 0, patch_dim - base_rank)))  # (patch_dim, base_rank)
+    def init_asymflow_buffers(self, patch_dim: int, basis_rank: int):
+        assert patch_dim >= basis_rank
+        eye = torch.eye(basis_rank)
+        self.register_buffer('proj_buffer', F.pad(eye, (0, 0, 0, patch_dim - basis_rank)))  # (patch_dim, basis_rank)
         self.register_buffer('scale_buffer', torch.tensor(1.0))
 
     def asymflow_calibration(self, timestep, batch_size: int, ndim: int):

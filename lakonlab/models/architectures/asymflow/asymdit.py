@@ -22,7 +22,7 @@ class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
             self,
             patch_size: int = 16,
             in_channels: int = 3,
-            base_rank: int = 32,
+            basis_rank: int = 32,
             num_timesteps=1,
             class_dropout_prob=0.0,
             num_attention_heads: int = 16,
@@ -97,7 +97,7 @@ class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
         # 4. AsymFlow attributes and buffers.
         self.num_timesteps = num_timesteps
         self.sigma_min = sigma_min
-        self.init_asymflow_buffers(in_channels * (patch_size ** 2), base_rank)
+        self.init_asymflow_buffers(in_channels * (patch_size ** 2), basis_rank)
 
     @staticmethod
     def patchify(latents, patch_size, pack_channels=True):
@@ -256,16 +256,16 @@ class AsymDiTTransformer2DModel(_AsymDiTTransformer2DModel):
                 pretrained_linear_proj, map_location='cpu', logger=logger)
             dtype = state_dict['pos_embed.proj.weight'].dtype
             p = self.patch_size
-            proj_mat = linear_proj_state_dict[f'proj_mat_p{p}']  # (in_channels * p2, base_rank)
+            proj_mat = linear_proj_state_dict[f'proj_mat_p{p}']  # (in_channels * p2, basis_rank)
             if 'pos_embed.proj.weight' in state_dict:
-                in_proj_weight = proj_mat.T.to(dtype)  # (base_rank, in_channels * p2)
+                in_proj_weight = proj_mat.T.to(dtype)  # (basis_rank, in_channels * p2)
                 state_dict['pos_embed.proj.weight'] = self._project_patch_embed_weight(
                     state_dict['pos_embed.proj.weight'],
                     in_proj_weight,
                     self.patch_size,
                     self.config.in_channels)
             if 'proj_out_2.weight' in state_dict and 'proj_out_2.bias' in state_dict:
-                out_proj_weight = proj_mat.to(dtype)  # (in_channels * p2, base_rank)
+                out_proj_weight = proj_mat.to(dtype)  # (in_channels * p2, basis_rank)
                 state_dict['proj_out_2.bias'] = (
                     out_proj_weight @ state_dict['proj_out_2.bias'].unsqueeze(-1)
                 ).squeeze(-1)
