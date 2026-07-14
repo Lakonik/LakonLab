@@ -174,7 +174,27 @@ torchrun --nnodes=1 --nproc_per_node=8 tools/test.py <PATH_TO_CONFIG> --ckpt <PA
 
 ### AsymFLUX.2 klein Training
 
-Instructions on data preparation will be added soon. Please refer to the [config](../configs/asymflow/asymflux2_klein_32gpus.py) for training details.
+Run the following command to download the full dataset containing 3 million text-image pairs.
+```bash
+python tools/download_laion3m_dataset.py
+```
+By default, the data will be saved to `data/laion-3m`, which requires 4TB of storage space. You can use the `--out-dir` argument to save the data to a different location (AWS S3 URLs are supported), and then update the data paths in the [training config file](../configs/asymflow/asymflux2_klein_32gpus.py) accordingly. Use `--num-shards` to download only a subset of the dataset (e.g., `--num-shards 4` to download 4/300 of the dataset).
+
+Run the following command to precompute the Procrustes subspace:
+```bash
+python tools/asymflow_subspace_procrustes.py configs/asymflow/asymflux2_klein_32gpus.py
+```
+
+Run the following command to train the AsymFLUX.2 klein model using DDP on 4 nodes with 8 GPUs each:
+```bash
+torchrun --nnodes=4 --nproc_per_node=8 --node_rank=<NODE_RANK> --master_addr=<MASTER_ADDR> --master_port=<MASTER_PORT> tools/train.py configs/asymflow/asymflux2_klein_32gpus.py --launcher pytorch --diff_seed
+```
+
+The above config specifies a training batch size of 8 images per GPU. This requires ~80GB of VRAM per GPU. You may use gradient accumulation or FSDP to reduce VRAM usage.
+- To enable gradient accumulation, uncomment the `grad_accum_batch_size=1` line in the `train_cfg` of the [ddp config](../configs/asymflow/_flux2_klein_ddp_train.py). This will reduce VRAM usage to ~45GB per GPU.
+- To use FSDP, modify the [training config file](../configs/asymflow/asymflux2_klein_32gpus.py) to replace `'./_flux2_klein_ddp_train.py'` with `'./_flux2_klein_fsdp_train.py'` in the `_base_` list. By default, the [fsdp config](../configs/asymflow/_flux2_klein_fsdp_train.py) also enables gradient accumulation. This will reduce VRAM usage to ~22GB per GPU across 8 GPUs.
+
+32 GPUs are required to reproduce the total batch size of 256 in the paper.
 
 ### AsymFLUX.2 klein Evaluation (HPSv3, DPG-Bench, GenEval)
 
@@ -204,7 +224,7 @@ torchrun --nnodes=1 --nproc_per_node=8 tools/test.py <PATH_TO_CONFIG> --ckpt <PA
 ## Essential Code
 
 - Subspace precomputation
-    - [asymflow_subspace_pca_dit.py](../tools/asymflow_subspace_pca_dit.py): Create a patch PCA subspace for pixel AsymFlow models using DiT patch convention (channel last).
+    - [asymflow_subspace_pca_dit.py](../tools/asymflow_subspace_pca_dit.py): Create a patch PCA subspace for AsymFlow models using DiT patch convention (channel last).
     - [asymflow_subspace_procrustes.py](../tools/asymflow_subspace_procrustes.py): Create a Procrustes latent-to-pixel subspace for pixel AsymFlow finetuning.
 - Modeling
     - [asymjit.py](../lakonlab/models/architectures/asymflow/asymjit.py): AsymFlow wrapper for JiT architecture.

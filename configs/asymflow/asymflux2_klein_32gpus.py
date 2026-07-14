@@ -1,14 +1,24 @@
-name = 'asymflux2_klein_32gpus'
+_base_ = ['./_flux2_klein_ddp_train.py']
 
+name = 'asymflux2_klein_32gpus'
 
 model = dict(
     type='LatentDiffusionTextImage',
+    text_encoder=dict(
+        type='PretrainedFlux2KleinTextEncoder'
+    ),
     vae=dict(
         type='OklabColorEncoder',
         use_affine_norm=True,
         mean=(0.56, 0.0, 0.01),
         std=0.16),
-    train_cached_latents_as_latents_2=True,
+    vae_2=dict(
+        type='PretrainedVAEFlux2',
+        model_name_or_path='black-forest-labs/FLUX.2-dev',
+        subfolder='vae',
+        freeze=True,
+        torch_dtype='bfloat16'
+    ),
     diffusion=dict(
         type='AsymFlowVR',
         latent_patch_size=2,
@@ -20,7 +30,6 @@ model = dict(
                 'proj_out',
                 'norm_out',
                 'lora'],
-            freeze_exclude_autocast_dtype='bfloat16',
             pretrained='huggingface://black-forest-labs/FLUX.2-klein-base-9B/transformer/diffusion_pytorch_model.safetensors.index.json',
             pretrained_linear_proj='checkpoints/asymflow_subspace_procrustes.pth',
             patch_size=16,
@@ -92,23 +101,12 @@ eval_interval = 250
 work_dir = f'work_dirs/{name}'
 # yapf: disable
 train_cfg = dict(
-    teacher_test_cfg=dict(
-        guidance_scale=1.0),
-    diffusion_grad_clip=200.0,
-    diffusion_grad_clip_begin_iter=100,
+    teacher_test_cfg=dict(guidance_scale=1.0),
 )
 test_cfg = dict(
     clamp_denoised=True,
 )
 
-optimizer = {
-    'diffusion': dict(
-        type='AdamW8bit', lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0,
-        paramwise_cfg=dict(custom_keys={
-            'proj_out': dict(lr_mult=10.0),
-        })
-    ),
-}
 data = dict(
     workers_per_gpu=8,
     train=dict(
@@ -116,14 +114,15 @@ data = dict(
         data_root='data/laion-3m/',
         image_dir='images',
         image_datalist_path='data/laion-3m/images.jsonl',
-        cache_dir='preproc_flux2_klein',
-        cache_datalist_path='data/laion-3m/preproc_flux2_klein.jsonl.gz',
-        ignore_cached_latents=False,  # load both images and latents
+        prompt_dataset_kwargs=dict(
+            path='json',
+            data_files='data/laion-3m/prompts.jsonl',
+            split='train'),
         negative_prompt_embeds_path='data/flux2_klein_empty_prompt_embeds.pth',
         image_scale_factor=1.0,
         image_scale_method='lanczos',
-        latent_patch_size=2,  # latent patch size = 2
-        vae_scale_factor=8,  # pixel patch size = 2 * 8 = 16
+        latent_patch_size=16,  # this refers to Oklab representation
+        vae_scale_factor=1,
         bucketize=True,
         end_ind=-128),
     train_dataloader=dict(samples_per_gpu=8),
@@ -132,12 +131,13 @@ data = dict(
         data_root='data/laion-3m/',
         image_dir='images',
         image_datalist_path='data/laion-3m/images.jsonl',
-        cache_dir='preproc_flux2_klein',
-        cache_datalist_path='data/laion-3m/preproc_flux2_klein.jsonl.gz',
-        ignore_cached_latents=True,  # latents are disgarded
+        prompt_dataset_kwargs=dict(
+            path='json',
+            data_files='data/laion-3m/prompts.jsonl',
+            split='train'),
         negative_prompt_embeds_path='data/flux2_klein_empty_prompt_embeds.pth',
         image_scale_factor=1.0,
-        latent_patch_size=16,  # this means pixel patch size
+        latent_patch_size=16,  # this refers to Oklab representation
         vae_scale_factor=1,
         latent_size=(3, 768, 1344),
         start_ind=-128,
@@ -146,15 +146,11 @@ data = dict(
     ),
     val_dataloader=dict(samples_per_gpu=1),
     test_dataloader=dict(samples_per_gpu=1),
+    pin_memory=True,
     persistent_workers=True,
     prefetch_factor=2,
     multiprocessing_context='fork',
 )
-lr_config = dict(
-    policy='fixed',
-    warmup='linear',
-    warmup_iters=100,
-    warmup_ratio=0.001)
 checkpoint_config = dict(
     interval=save_interval,
     must_save_interval=must_save_interval,
@@ -183,11 +179,11 @@ for data_split in ['val']:
                     orthogonal_guidance=1.0
                 )),
             interval=eval_interval,
-            metrics=[
-                dict(type='HPSv2', hps_version='v2.1'),
-                dict(type='HPSv3'),
-                dict(type='ColorStats')
-            ],
+            # metrics=[
+            #     dict(type='HPSv2', hps_version='v2.1'),
+            #     dict(type='HPSv3'),
+            #     dict(type='ColorStats')
+            # ],
             viz_dir=f'viz/{name}/{data_split}_{prefix}',
             metric_cpu_offload=True,
             save_best_ckpt=False))
@@ -213,22 +209,6 @@ custom_hooks = [
         priority='VERY_HIGH'),
 ]
 
-# use dynamic runner
-runner = dict(
-    type='DynamicIterBasedRunner',
-    is_dynamic_ddp=False,
-    pass_training_status=True,
-    ckpt_trainable_only=True,
-    ckpt_fp16=True,
-    ckpt_fp16_ema=True,
-    gc_interval=5)
-dist_params = dict(backend='nccl')
-log_level = 'INFO'
 load_from = None
 resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]
-
-module_wrapper = 'ddp'
-
-cudnn_benchmark = True
-mp_start_method = 'fork'
