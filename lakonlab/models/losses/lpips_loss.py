@@ -14,13 +14,13 @@ def lpips_loss(pred, target, model):
 _lpips_cache = {}
 
 
-def load_lpips(torch_dtype):
-    cache_key = torch_dtype
+def load_lpips(torch_dtype, device):
+    cache_key = f'{torch_dtype}_{device}'
     if cache_key in _lpips_cache:
         return _lpips_cache[cache_key]
 
     model = lpips.LPIPS(net='vgg', eval_mode=True, pnet_tune=False)
-    model = model.to(getattr(torch, torch_dtype))
+    model = model.to(dtype=getattr(torch, torch_dtype), device=device)
     _lpips_cache[cache_key] = model
     return model
 
@@ -31,11 +31,12 @@ class LPIPSLoss(nn.Module):
     def __init__(self,
                  spatial=True,
                  torch_dtype='bfloat16',
+                 device='cuda',
                  loss_weight=1.0,
                  reduction='mean'):
         super().__init__()
         self.spatial = spatial
-        self.lpips = [load_lpips(torch_dtype)]
+        self.lpips = [load_lpips(torch_dtype, device)]
         self.dtype = getattr(torch, torch_dtype)
         self.loss_weight = loss_weight
         self.reduction = reduction
