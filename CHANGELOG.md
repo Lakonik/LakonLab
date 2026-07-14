@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.2] - 2026-07-13
+
+### Added
+- AsymFLUX.2 training instructions and data tool.
+- Support for persistent local caching for S3 objects.
+- Support for downloading from HuggingFace Space and Dataset repositories.
+
+### Changed
+- **Breaking:** Rename the AsymFlow `base_rank` option to `basis_rank`.
+- Improve DINOv2 position embedding resizing and compiled preprocessing.
+- Reduce training log collection synchronization overhead.
+- Strictly align DiT weight initialization to the [original DiT implementation](https://github.com/facebookresearch/dit).
+
+### Fixed
+- Fix NaN gradients in the Oklab codec.
+- Fix CMYK image loading.
+
 ## [0.2.1] - 2026-06-13
 
 ### Added
