@@ -4,7 +4,7 @@ Official PyTorch implementation of the paper:
 
 **Asymmetric Flow Models**
     <br>
-    arXiv 2026
+    In NeurIPS 2026
     <br>
     [Hansheng Chen](https://lakonik.github.io/),
     [Jan Ackermann](https://janackermann.info/),
