@@ -1,6 +1,8 @@
 # LakonLab: Official Codebase for AsymFlow, pi-Flow, and GMFlow
 
-Official PyTorch implementation of the papers:
+Official PyTorch implementation of the following projects:
+
+- Upcoming: [**pi-H3**](https://hanshengchen.com/blog/pi-h3/), **AnisoT2I**, **pi-Flow v2**, [**DWD**](https://hanshengchen.com/dwd/), [**AnisoFlow**](https://hanshengchen.com/anisoflow/)
 
 - **Asymmetric Flow Models [[README](docs/AsymFlow.md)]**
     <br>
