@@ -348,7 +348,7 @@ class GMFlux2Transformer2DModel(_GMFlux2Transformer2DModel):
                 load_full_state_dict(self, state_dict, logger=logger, assign=True)
                 if len(lora_state_dict) > 0:
                     self.load_lora_adapter(lora_state_dict, prefix=None)
-                    self.fuse_lora()
+                    self.fuse_lora(safe_fusing=True)
                     self.unload_lora()
                     self.requires_grad_(True)  # PEFT freezes the weights after fusing
             else:

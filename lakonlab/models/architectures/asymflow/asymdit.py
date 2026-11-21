@@ -9,7 +9,7 @@ from diffusers.configuration_utils import register_to_config
 
 from ...builder import MODULES
 from ..diffusers.dit import CombinedTimestepLabelEmbeddingsMod, BasicTransformerBlockMod, _DiTTransformer2DModelMod
-from ..utils import flex_freeze
+from ..utils import flex_freeze, cast_dtype
 from lakonlab.utils import get_root_logger
 from lakonlab.runner.checkpoint import _load_cached_checkpoint, load_full_state_dict
 from .common import AsymFlowMixin
@@ -17,18 +17,24 @@ from .common import AsymFlowMixin
 
 class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
 
+    # _keep_in_fp32_modules is also used by diffusers in quantization and module dtype detection
+    # (modules in this list are excluded from dtype detection)
+    _keep_in_fp32_modules = ['proj_buffer', 'scale_buffer']
+
     @register_to_config
     def __init__(
             self,
             patch_size: int = 16,
             in_channels: int = 3,
             basis_rank: int = 32,
+            input_bottleneck: bool = False,
             num_timesteps=1,
             class_dropout_prob=0.0,
             num_attention_heads: int = 16,
             attention_head_dim: int = 72,
             out_channels: int | None = None,
             num_layers: int = 28,
+            secondary_emb_start_layer: int | None = None,
             dropout: float = 0.0,
             norm_num_groups: int = 32,
             attention_bias: bool = True,
@@ -39,7 +45,8 @@ class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
             norm_type: str = 'ada_norm_zero',
             norm_elementwise_affine: bool = False,
             norm_eps: float = 1e-5,
-            sigma_min: float = 1e-4):
+            sigma_min: float = 1e-4,
+            use_calibration: bool = True):
 
         super(DiTTransformer2DModel, self).__init__()
 
@@ -63,15 +70,21 @@ class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
         self.height = self.config.sample_size
         self.width = self.config.sample_size
 
-        self.patch_size = self.config.patch_size
+        self.patch_size = patch_size
         self.pos_embed = PatchEmbed(
             height=self.config.sample_size,
             width=self.config.sample_size,
-            patch_size=self.config.patch_size,
-            in_channels=self.config.in_channels,
+            patch_size=patch_size,
+            in_channels=basis_rank // (patch_size * patch_size) if input_bottleneck else self.config.in_channels,
             embed_dim=self.inner_dim)
         self.emb = CombinedTimestepLabelEmbeddingsMod(
             num_embeds_ada_norm, self.inner_dim, class_dropout_prob=0.0)
+
+        self.secondary_emb_start_layer = self.config.secondary_emb_start_layer
+        if self.secondary_emb_start_layer is not None:
+            assert 0 <= self.secondary_emb_start_layer < self.config.num_layers
+            self.secondary_emb = CombinedTimestepLabelEmbeddingsMod(
+                num_embeds_ada_norm, self.inner_dim, class_dropout_prob=0.0)
 
         self.transformer_blocks = nn.ModuleList([
             BasicTransformerBlockMod(
@@ -92,12 +105,15 @@ class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
         self.proj_out_2 = nn.Linear(
-            self.inner_dim, self.config.patch_size * self.config.patch_size * self.out_channels)
+            self.inner_dim, patch_size * patch_size * self.out_channels)
 
         # 4. AsymFlow attributes and buffers.
-        self.num_timesteps = num_timesteps
+        self.basis_rank = basis_rank
+        self.input_bottleneck = input_bottleneck
         self.sigma_min = sigma_min
-        self.init_asymflow_buffers(in_channels * (patch_size ** 2), basis_rank)
+        self.num_timesteps = num_timesteps
+        self.init_asymflow_buffers(
+            in_channels * (patch_size ** 2), basis_rank, use_calibration=use_calibration)
 
     @staticmethod
     def patchify(latents, patch_size, pack_channels=True):
@@ -158,15 +174,32 @@ class _AsymDiTTransformer2DModel(AsymFlowMixin, _DiTTransformer2DModelMod):
 
         # scale and timestep calibration
         calibration = self.asymflow_calibration(timestep, bs, packed_ndim)
-        hidden_states = x_t * calibration.k.reshape(bs, *((ndim - 1) * [1])).to(x_t.dtype)
+        if self.input_bottleneck:
+            if self.use_calibration:
+                hidden_states = x_t_packed * calibration.k.to(x_t_packed.dtype)
+            else:
+                hidden_states = x_t_packed
+            hidden_states = self.unpatchify(self.unpack(
+                hidden_states @ self.proj_buffer.to(hidden_states.dtype),
+                h // self.patch_size, w // self.patch_size
+            ), self.patch_size)
+        else:
+            if self.use_calibration:
+                hidden_states = x_t * calibration.k.reshape(bs, *((ndim - 1) * [1])).to(x_t.dtype)
+            else:
+                hidden_states = x_t
 
         u_a_packed = super().forward(
-            hidden_states, calibration.timestep, unpatchify_output=False, **kwargs)
+            hidden_states,
+            calibration.timestep,
+            unpatchify_output=False,
+            fp32_final_layer=True,
+            **kwargs)
 
         output_packed = self.asymflow_velocity(u_a_packed, x_t_packed, calibration)
 
         output = self.unpatchify(self.unpack(
-            output_packed.to(x_t.dtype),
+            output_packed,
             h // self.patch_size, w // self.patch_size
         ), self.patch_size)
 
@@ -203,7 +236,7 @@ class AsymDiTTransformer2DModel(_AsymDiTTransformer2DModel):
         self.autocast_dtype = autocast_dtype
 
         if torch_dtype is not None:
-            self.to(getattr(torch, torch_dtype))
+            cast_dtype(self, getattr(torch, torch_dtype), keep_fp32_keys=self._keep_in_fp32_modules)
 
         self.freeze = freeze
         if self.freeze:
@@ -250,20 +283,37 @@ class AsymDiTTransformer2DModel(_AsymDiTTransformer2DModel):
         else:
             state_dict = checkpoint
 
+        if self.secondary_emb_start_layer is not None:
+            secondary_emb_state_dict = dict()
+            for k, v in state_dict.items():
+                if k.startswith('emb'):
+                    secondary_k = 'secondary_' + k
+                    if secondary_k not in state_dict:
+                        secondary_emb_state_dict[secondary_k] = v  # no need to clone since assign=False
+            state_dict.update(secondary_emb_state_dict)
+
         # load the pretrained linear projection weights
         if pretrained_linear_proj is not None:
             linear_proj_state_dict = _load_cached_checkpoint(
                 pretrained_linear_proj, map_location='cpu', logger=logger)
             dtype = state_dict['pos_embed.proj.weight'].dtype
             p = self.patch_size
-            proj_mat = linear_proj_state_dict[f'proj_mat_p{p}']  # (in_channels * p2, basis_rank)
+            proj_mat_key = f'proj_mat_p{p}'
+            if proj_mat_key in linear_proj_state_dict:
+                proj_mat = linear_proj_state_dict[proj_mat_key]  # (in_channels * p2, basis_rank)
+            else:
+                proj_mat = self.proj_buffer  # padded identity init
             if 'pos_embed.proj.weight' in state_dict:
-                in_proj_weight = proj_mat.T.to(dtype)  # (basis_rank, in_channels * p2)
+                if self.input_bottleneck:
+                    # the runtime proj_buffer projection replaces the pretrained projector
+                    in_proj_weight = torch.eye(self.basis_rank, dtype=dtype)
+                else:
+                    in_proj_weight = proj_mat.T.to(dtype)  # (basis_rank, in_channels * p2)
                 state_dict['pos_embed.proj.weight'] = self._project_patch_embed_weight(
                     state_dict['pos_embed.proj.weight'],
                     in_proj_weight,
                     self.patch_size,
-                    self.config.in_channels)
+                    self.pos_embed.proj.in_channels)
             if 'proj_out_2.weight' in state_dict and 'proj_out_2.bias' in state_dict:
                 out_proj_weight = proj_mat.to(dtype)  # (in_channels * p2, basis_rank)
                 state_dict['proj_out_2.bias'] = (
@@ -272,11 +322,19 @@ class AsymDiTTransformer2DModel(_AsymDiTTransformer2DModel):
                 state_dict['proj_out_2.weight'] = (
                     out_proj_weight @ state_dict['proj_out_2.weight']
                 )
+                if f'orthogonal_lift_p{p}' in linear_proj_state_dict:
+                    state_dict['proj_out_2.weight'] = (
+                        state_dict['proj_out_2.weight']
+                        - linear_proj_state_dict[f'orthogonal_lift_p{p}'].to(dtype))
+                if f'orthogonal_lift_bias_p{p}' in linear_proj_state_dict:
+                    state_dict['proj_out_2.bias'] = (
+                        state_dict['proj_out_2.bias']
+                        - linear_proj_state_dict[f'orthogonal_lift_bias_p{p}'].to(dtype))
             state_dict['proj_buffer'] = proj_mat
             if f'scale_p{p}' in linear_proj_state_dict:
                 state_dict['scale_buffer'] = linear_proj_state_dict[f'scale_p{p}']
 
-        load_full_state_dict(self, state_dict, logger=logger)
+        load_full_state_dict(self, state_dict, logger=logger, assign=False)
 
     def _forward_impl(self, *args, **kwargs):
         return super().forward(*args, **kwargs)

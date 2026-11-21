@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -10,12 +10,13 @@ from diffusers.models.embeddings import (
     PatchEmbed, Timesteps, CombinedTimestepLabelEmbeddings, TimestepEmbedding, LabelEmbedding)
 from diffusers.models.normalization import AdaLayerNormZero
 from diffusers.configuration_utils import register_to_config
-from mmcv.runner import load_checkpoint, _load_checkpoint, load_state_dict
 from mmcv.cnn import constant_init, xavier_init
 
 from ...builder import MODULES
-from ..utils import flex_freeze
+from ..dwd_head import DWDHeadMixin
+from ..utils import flex_freeze, fp32_module_forward
 from lakonlab.utils import get_root_logger
+from lakonlab.runner.checkpoint import _load_cached_checkpoint, load_full_state_dict
 
 
 class LabelEmbeddingMod(LabelEmbedding):
@@ -51,9 +52,9 @@ class BasicTransformerBlockMod(BasicTransformerBlock):
             num_attention_heads: int,
             attention_head_dim: int,
             dropout=0.0,
-            cross_attention_dim: Optional[int] = None,
+            cross_attention_dim: int | None = None,
             activation_fn: str = 'geglu',
-            num_embeds_ada_norm: Optional[int] = None,
+            num_embeds_ada_norm: int | None = None,
             attention_bias: bool = False,
             only_cross_attention: bool = False,
             double_self_attention: bool = False,
@@ -63,9 +64,9 @@ class BasicTransformerBlockMod(BasicTransformerBlock):
             norm_eps: float = 1e-5,
             final_dropout: bool = False,
             attention_type: str = 'default',
-            ada_norm_continous_conditioning_embedding_dim: Optional[int] = None,
-            ada_norm_bias: Optional[int] = None,
-            ff_inner_dim: Optional[int] = None,
+            ada_norm_continous_conditioning_embedding_dim: int | None = None,
+            ada_norm_bias: int | None = None,
+            ff_inner_dim: int | None = None,
             ff_bias: bool = True,
             attention_out_bias: bool = True):
         super(BasicTransformerBlock, self).__init__()
@@ -105,14 +106,14 @@ class BasicTransformerBlockMod(BasicTransformerBlock):
     def forward(
             self,
             hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            encoder_hidden_states: Optional[torch.Tensor] = None,
-            encoder_attention_mask: Optional[torch.Tensor] = None,
-            timestep: Optional[torch.LongTensor] = None,
+            attention_mask: torch.Tensor | None = None,
+            encoder_hidden_states: torch.Tensor | None = None,
+            encoder_attention_mask: torch.Tensor | None = None,
+            timestep: torch.Tensor | None = None,
             cross_attention_kwargs: Dict[str, Any] = None,
-            class_labels: Optional[torch.LongTensor] = None,
-            emb: Optional[torch.Tensor] = None,
-            added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+            class_labels: torch.LongTensor | None = None,
+            emb: torch.Tensor | None = None,
+            added_cond_kwargs: Dict[str, torch.Tensor] | None = None) -> torch.Tensor:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
             hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype, emb=emb)
 
@@ -147,7 +148,7 @@ class BasicTransformerBlockMod(BasicTransformerBlock):
         return hidden_states
 
 
-class _DiTTransformer2DModelMod(DiTTransformer2DModel):
+class _DiTTransformer2DModelMod(DWDHeadMixin, DiTTransformer2DModel):
 
     _cache_storage = dict()
 
@@ -160,23 +161,26 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
     @register_to_config
     def __init__(
             self,
-            class_dropout_prob=0.0,
+            class_dropout_prob: float = 0.0,
             num_attention_heads: int = 16,
             attention_head_dim: int = 72,
             in_channels: int = 4,
-            out_channels: Optional[int] = None,
+            out_channels: int | None = None,
             num_layers: int = 28,
+            secondary_emb_start_layer: int | None = None,
+            dwd_head_config: dict | None = None,
             dropout: float = 0.0,
             norm_num_groups: int = 32,
             attention_bias: bool = True,
             sample_size: int = 32,
             patch_size: int = 2,
             activation_fn: str = 'gelu-approximate',
-            num_embeds_ada_norm: Optional[int] = 1000,
+            num_embeds_ada_norm: int | None = 1000,
             upcast_attention: bool = False,
             norm_type: str = 'ada_norm_zero',
             norm_elementwise_affine: bool = False,
-            norm_eps: float = 1e-5):
+            norm_eps: float = 1e-5,
+            pooled_output: bool = False):
 
         super(DiTTransformer2DModel, self).__init__()
 
@@ -210,6 +214,12 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
         self.emb = CombinedTimestepLabelEmbeddingsMod(
             num_embeds_ada_norm, self.inner_dim, class_dropout_prob=0.0)
 
+        self.secondary_emb_start_layer = self.config.secondary_emb_start_layer
+        if self.secondary_emb_start_layer is not None:
+            assert 0 <= self.secondary_emb_start_layer < self.config.num_layers
+            self.secondary_emb = CombinedTimestepLabelEmbeddingsMod(
+                num_embeds_ada_norm, self.inner_dim, class_dropout_prob=0.0)
+
         self.transformer_blocks = nn.ModuleList([
             BasicTransformerBlockMod(
                 self.inner_dim,
@@ -228,11 +238,20 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
         # 3. Output blocks.
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
-        self.proj_out_2 = nn.Linear(
-            self.inner_dim, self.config.patch_size * self.config.patch_size * self.out_channels)
+        if self.config.pooled_output:
+            self.proj_out_2 = nn.Linear(self.inner_dim, self.out_channels)
+        else:
+            self.proj_out_2 = nn.Linear(
+                self.inner_dim, self.config.patch_size * self.config.patch_size * self.out_channels)
+
+        # Optional DWD heads
+        if dwd_head_config is not None:
+            self.init_dwd_head(self.inner_dim, **dwd_head_config)
 
     # https://github.com/facebookresearch/DiT/blob/main/models.py
     def init_weights(self):
+        super().init_weights()
+
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 xavier_init(m, distribution='uniform')
@@ -245,8 +264,11 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
         nn.init.constant_(self.pos_embed.proj.bias, 0)
 
         # Initialize timestep embedding MLP
-        torch.nn.init.normal_(self.emb.timestep_embedder.linear_1.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.emb.timestep_embedder.linear_2.weight, mean=0.0, std=0.02)
+        for emb in [self.emb, getattr(self, 'secondary_emb', None)]:
+            if emb is None:
+                continue
+            torch.nn.init.normal_(emb.timestep_embedder.linear_1.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(emb.timestep_embedder.linear_2.weight, mean=0.0, std=0.02)
 
         # Upstream DiT initializes one fused qkv Linear with tripled fan-out
         qkv_init_scale = 2 ** -0.5
@@ -267,12 +289,14 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
     def forward(
             self,
             hidden_states: torch.Tensor,
-            timestep: Optional[torch.LongTensor] = None,
-            class_labels: Optional[torch.LongTensor] = None,
+            timestep: torch.Tensor | None = None,
+            class_labels: torch.LongTensor | None = None,
             cross_attention_kwargs: Dict[str, Any] = None,
-            cache_mode: Optional[str] = None,
-            cache_config: Optional[dict] = None,
-            unpatchify_output: bool = True) -> torch.Tensor:
+            cache_mode: str | None = None,
+            cache_config: dict | None = None,
+            unpatchify_output: bool = True,
+            return_features: bool = False,
+            fp32_final_layer: bool = False) -> torch.Tensor | tuple:
         # 1. Input
         bs, _, h, w = hidden_states.size()
         height, width = h // self.patch_size, w // self.patch_size
@@ -280,12 +304,14 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
 
         if cache_mode is not None:
             cache_after_block = cache_config['cache_after_block']
+            if self.secondary_emb_start_layer is not None:
+                assert cache_after_block < self.secondary_emb_start_layer
 
         if cache_mode == 'load':
             hidden_states = self._cache_storage.pop('hidden_states')[-bs:]
             cond_emb = self._cache_storage.pop('cond_emb')[-bs:]
             uncond_emb = self._cache_storage.pop('uncond_emb')[-bs:] if dropout_enabled else None
-
+            start_block = cache_after_block + 1
         else:
             hidden_states = self.pos_embed(hidden_states)
             cond_emb = self.emb(
@@ -295,13 +321,20 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
                 torch.full_like(class_labels, self.config.num_embeds_ada_norm),
                 hidden_dtype=hidden_states.dtype
             ) if dropout_enabled else None
+            start_block = 0
 
         # 2. Blocks
-        start_block = 0
-        if cache_mode == 'load':
-            start_block = cache_after_block + 1
-
         for index_block in range(start_block, len(self.transformer_blocks)):
+            # Update emb when we reach the specified block
+            if index_block == self.secondary_emb_start_layer:
+                cond_emb = self.secondary_emb(
+                    timestep, class_labels, hidden_dtype=hidden_states.dtype)
+                uncond_emb = self.secondary_emb(
+                    timestep,
+                    torch.full_like(class_labels, self.config.num_embeds_ada_norm),
+                    hidden_dtype=hidden_states.dtype
+                ) if dropout_enabled else None
+
             block = self.transformer_blocks[index_block]
 
             if dropout_enabled:
@@ -344,17 +377,20 @@ class _DiTTransformer2DModelMod(DiTTransformer2DModel):
             emb = torch.where(dropout_mask, uncond_emb, cond_emb)
         else:
             emb = cond_emb
-        shift, scale = self.proj_out_1(F.silu(emb)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
-        output = self.proj_out_2(hidden_states)
+        shift, scale = fp32_module_forward(
+            self.proj_out_1, F.silu(emb), enabled=fp32_final_layer).chunk(2, dim=1)
+        hidden_states = fp32_module_forward(
+            self.norm_out, hidden_states, enabled=fp32_final_layer) * (1 + scale[:, None]) + shift[:, None]
+        output = fp32_module_forward(self.proj_out_2, hidden_states, enabled=fp32_final_layer)
 
         if unpatchify_output:
+            patch_size = 1 if self.config.pooled_output else self.patch_size
             output = output.reshape(
-                bs, height, width, self.patch_size, self.patch_size, self.out_channels
+                bs, height, width, patch_size, patch_size, self.out_channels
             ).permute(0, 5, 1, 3, 2, 4).reshape(
-                bs, self.out_channels, height * self.patch_size, width * self.patch_size)
+                bs, self.out_channels, height * patch_size, width * patch_size)
 
-        return output
+        return (output, hidden_states) if return_features else output
 
 
 @MODULES.register_module()
@@ -366,6 +402,7 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
             freeze=False,
             freeze_exclude=[],
             pretrained=None,
+            pretrained_dwd_head=None,
             torch_dtype='float32',
             compile_forward=False,
             compile_kwargs=dict(
@@ -379,7 +416,7 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
             **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.init_weights(pretrained)
+        self.init_weights(pretrained, pretrained_dwd_head)
 
         if autocast_dtype is not None:
             assert torch_dtype == 'float32'
@@ -403,16 +440,17 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
         if compile_forward:
             self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
 
-    def init_weights(self, pretrained=None):
+    def init_weights(self, pretrained=None, pretrained_dwd_head=None):
         super().init_weights()
+
         if pretrained is not None:
             logger = get_root_logger()
-            # load_checkpoint(self, pretrained, map_location='cpu', strict=False, logger=logger)
-            checkpoint = _load_checkpoint(pretrained, map_location='cpu', logger=logger)
+            checkpoint = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
             if 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']
             else:
                 state_dict = checkpoint
+
             # load from GMDiT V1 model with 1 Gaussian
             p2 = self.config.patch_size * self.config.patch_size
             ori_out_channels = p2 * self.out_channels
@@ -438,6 +476,7 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
                     state_dict['proj_out_2.bias'] = state_dict['proj_out_2.bias'].reshape(
                         p2, 2 * self.out_channels
                     )[:, :self.out_channels].reshape(ori_out_channels)
+
             if 'emb.class_embedder.embedding_table.weight' not in state_dict \
                     and 'transformer_blocks.0.norm1.emb.class_embedder.embedding_table.weight' in state_dict:
                 # convert original diffusers DiT model to our modified DiT model with shared embeddings
@@ -452,17 +491,43 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
                 state_dict.update(state_update)
                 for k in keys_to_remove:
                     del state_dict[k]
-            load_state_dict(self, state_dict, logger=logger)
 
-    def _forward_impl(self, *args, **kwargs):
-        return super().forward(*args, **kwargs)
+            if self.secondary_emb_start_layer is not None:
+                secondary_emb_state_dict = dict()
+                for k, v in state_dict.items():
+                    if k.startswith('emb'):
+                        secondary_k = 'secondary_' + k
+                        if secondary_k not in state_dict:
+                            secondary_emb_state_dict[secondary_k] = v  # no need to clone since assign=False
+                state_dict.update(secondary_emb_state_dict)
+
+            if pretrained_dwd_head is not None:
+                state_dict.update(_load_cached_checkpoint(
+                    pretrained_dwd_head, map_location='cpu', logger=logger))
+
+            load_full_state_dict(self, state_dict, logger=logger, assign=False)
+
+    def _forward_impl(self, hidden_states, return_pixels=False, return_features=False, **kwargs):
+        output = super().forward(
+            hidden_states=hidden_states, return_features=return_pixels or return_features, **kwargs)
+        auxiliary_output = None
+        if return_pixels or return_features:
+            output, auxiliary_output = output
+        if return_pixels:
+            h, w = hidden_states.shape[-2:]
+            auxiliary_output = self.forward_dwd_head(
+                auxiliary_output, (h // self.patch_size, w // self.patch_size))
+        return output, auxiliary_output
 
     def forward(
             self,
             hidden_states: torch.Tensor,
-            timestep: Optional[torch.LongTensor] = None,
-            class_labels: Optional[torch.LongTensor] = None,
+            timestep: torch.Tensor | None = None,
+            class_labels: torch.LongTensor | None = None,
+            return_pixels: bool = False,
+            return_features: bool = False,
             **kwargs):
+        class_labels = class_labels[-hidden_states.size(0):]
         if self.autocast_dtype is not None:
             dtype = getattr(torch, self.autocast_dtype)
         else:
@@ -471,14 +536,15 @@ class DiTTransformer2DModelMod(_DiTTransformer2DModelMod):
                 device_type='cuda',
                 enabled=self.autocast_dtype is not None,
                 dtype=dtype if self.autocast_dtype is not None else None):
-            if self._compiled_forward is not None:
-                return self._compiled_forward(
-                    hidden_states.to(dtype),
-                    timestep=timestep,
-                    class_labels=class_labels,
-                    **kwargs)
-            return self._forward_impl(
+            forward_fn = self._forward_impl if self._compiled_forward is None else self._compiled_forward
+            output, auxiliary_output = forward_fn(
                 hidden_states.to(dtype),
                 timestep=timestep,
                 class_labels=class_labels,
+                return_pixels=return_pixels,
+                return_features=return_features,
                 **kwargs)
+        if return_pixels or return_features:
+            return output, auxiliary_output
+        else:
+            return output

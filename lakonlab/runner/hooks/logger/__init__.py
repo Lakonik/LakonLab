@@ -26,5 +26,6 @@ LoggerHook.after_train_iter = _after_train_iter
 LoggerHook.after_train_epoch = _after_train_epoch
 
 from .text import TextLoggerHook
+from .wandb import WandbLoggerHook
 
-__all__ = ['LoggerHook', 'TextLoggerHook']
+__all__ = ['LoggerHook', 'TextLoggerHook', 'WandbLoggerHook']

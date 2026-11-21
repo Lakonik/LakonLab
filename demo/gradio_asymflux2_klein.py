@@ -7,8 +7,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 import gradio as gr
-from mmcv.runner import set_random_seed
 from diffusers import Flux2KleinPipeline
+from lakonlab.runner.utils import set_random_seed
 from lakonlab.models.architectures import OklabColorEncoder
 from lakonlab.models.diffusions.schedulers import FlowAdapterScheduler
 from lakonlab.pipelines.pipeline_pixelflux2_klein import PixelFlux2KleinPipeline
@@ -128,8 +128,7 @@ def main():
         ).images[0]
 
     with gr.Blocks(analytics_enabled=False,
-                   title='AsymFLUX.2 klein Demo',
-                   css_paths='lakonlab/ui/gradio/style.css'
+                   title='AsymFLUX.2 klein Demo'
                    ) as demo:
 
         md_txt = '# AsymFLUX.2 klein Demo\n\n' \
@@ -160,7 +159,7 @@ def main():
                  + (['rewrite_prompt', 'rewritten_prompt'] if args.use_rewriter else []),
             rewrite_prompt_api=run_rewrite_prompt,
             rewrite_prompt_args=['last_seed', 'prompt', 'rewrite_prompt'])
-        demo.queue().launch(share=args.share)
+        demo.queue().launch(share=args.share, ssr_mode=False, css_paths='lakonlab/ui/gradio/style.css')
 
 
 if __name__ == "__main__":

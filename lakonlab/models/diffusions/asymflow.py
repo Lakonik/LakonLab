@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from ..builder import MODULES, build_module
 from . import GaussianFlow
 from lakonlab.models.architectures.utils import get_module_device
-from lakonlab.utils import module_eval
+from lakonlab.utils import module_eval, rgetattr
 
 
 def calc_shifted_signal_ratio(sigma, shift):
@@ -63,8 +63,9 @@ class AsymFlowVR(GaussianFlow):
         sigma_clamped = sigma.clamp(min=self.sigma_min)
 
         # AsymFlowVR data preparation
-        proj_mat = self.denoising.proj_buffer.to(dtype=dtype)  # (full_rank, basis_rank)
-        s = self.denoising.scale_buffer.to(dtype=dtype)
+        # Use the teacher basis for reconstruction from the teacher output.
+        proj_mat = rgetattr(teacher, 'denoising.proj_buffer').to(dtype=dtype)  # (full_rank, basis_rank)
+        s = rgetattr(teacher, 'denoising.scale_buffer').to(dtype=dtype)
 
         latents_patchified = self.denoising.patchify(latents_2, self.latent_patch_size)
         latents_patchified_shape = latents_patchified.shape[2:]  # (h, w) or (t, h, w)
@@ -87,6 +88,9 @@ class AsymFlowVR(GaussianFlow):
             ref_x_0_low_rank = self.u_to_x_0(ref_u_low_rank, x_t_low_rank, sigma=sigma)
 
         # full-rank forward
+        if rgetattr(self.denoising, 'use_spectral_update', False):
+            kwargs = kwargs.copy()
+            kwargs.update(x_0=x_0, noise=noise, loss_weight=(sigma / sigma_clamped).square().flatten())
         pred_u = self.pred(x_t, t, **kwargs)
         pred_x_0 = self.u_to_x_0(pred_u, x_t, sigma=sigma)
 
@@ -123,8 +127,8 @@ class AsymFlowVR(GaussianFlow):
                 vae_dtype = vae.dtype
             else:
                 vae_dtype = next(vae.parameters()).dtype
-            pred_image = vae.decode(pred_x_0.to(vae_dtype))
-            tgt_image = vae.decode(x_0.to(vae_dtype))
+            pred_images = vae.decode(pred_x_0.to(vae_dtype))
+            tgt_images = vae.decode(x_0.to(vae_dtype))
 
             vr_coef_gate = self.denoising.unpatchify(
                 vr_coef.expand_as(low_rank_diff).square().mean(dim=1, keepdim=True).sqrt(),  # (bs, 1, patch_numel, *)
@@ -133,7 +137,7 @@ class AsymFlowVR(GaussianFlow):
             time_weight = shifted_signal_ratio / sigma_clamped.square()
 
             perceptual_loss = self.perceptual_loss(
-                pred_image, tgt_image, weight=vr_coef_gate * time_weight)
+                pred_images, tgt_images, weight=vr_coef_gate * time_weight)
             loss = loss + perceptual_loss
             log_vars.update(loss_perceptual=perceptual_loss.detach())
 

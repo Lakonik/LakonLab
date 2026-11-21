@@ -79,7 +79,7 @@ class ZImageTransformer2DModel(_ZImageTransformer2DModel):
                     lora_state_dict = _load_cached_checkpoint(
                         pretrained_lora_single, map_location='cpu', logger=logger)
                     self.load_lora_adapter(lora_state_dict)
-                    self.fuse_lora(lora_scale=pretrained_lora_scale_single)
+                    self.fuse_lora(lora_scale=pretrained_lora_scale_single, safe_fusing=True)
                     self.unload_lora()
                     self.requires_grad_(True)  # PEFT freezes the weights after fusing
 

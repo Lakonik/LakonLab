@@ -33,5 +33,4 @@ fsdp_kwargs = dict(
     exclude_keys=['vae'],
     tie_key_mappings=['teacher->diffusion', 'teacher->diffusion_ema'],
 )
-cudnn_benchmark = True
 mp_start_method = 'fork'

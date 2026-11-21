@@ -1,13 +1,48 @@
 import math
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
+from ..builder import MODULES
 from lakonlab.ops.gmflow_ops.gmflow_ops import gm_logprob
 from .utils import weighted_loss
 
 
 _reduction_modes = ['none', 'mean', 'sum', 'batchmean', 'flatmean']
+
+
+@weighted_loss
+def l1_loss(pred, target):
+    return F.l1_loss(pred, target, reduction='none')
+
+
+@MODULES.register_module()
+class L1Loss(nn.Module):
+
+    def __init__(self, loss_weight=1.0, reduction='mean'):
+        super().__init__()
+        self.loss_weight = loss_weight
+        self.reduction = reduction
+
+    def forward(self, pred, target, weight=None, avg_factor=None):
+        return self.loss_weight * l1_loss(
+            pred, target, weight=weight, reduction=self.reduction, avg_factor=avg_factor)
+
+
+@MODULES.register_module()
+class TemporalL1Loss(L1Loss):
+
+    def forward(self, pred, target, weight=None, avg_factor=None):
+        if pred.ndim == 5 and pred.size(2) > 1:
+            t = pred.size(2)
+            pred = pred.diff(dim=2)
+            target = target.diff(dim=2)
+            if weight is not None and weight.ndim >= 3 and weight.size(-3) == t:
+                weight = weight.unfold(-3, 2, 1).mean(dim=-1)
+        else:
+            t = 1
+        return super().forward(pred, target, weight=weight, avg_factor=avg_factor) * (t - 1) / t
 
 
 @weighted_loss

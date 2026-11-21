@@ -17,8 +17,8 @@ mmcv.parallel._functions._get_stream = _get_stream_wrapper
 from .ddp_wrapper import DistributedDataParallelWrapper, MMDistributedDataParallelFix
 from .fsdp_wrapper import FSDPWrapper
 from .fsdp2_wrapper import FSDP2Wrapper
-from .utils import apply_module_wrapper
+from .utils import apply_module_wrapper, maybe_ddp_no_sync
 
 __all__ = [
     'MMDistributedDataParallelFix', 'DistributedDataParallelWrapper', 'FSDPWrapper', 'FSDP2Wrapper',
-    'apply_module_wrapper']
+    'apply_module_wrapper', 'maybe_ddp_no_sync']

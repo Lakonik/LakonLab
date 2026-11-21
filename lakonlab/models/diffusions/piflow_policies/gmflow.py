@@ -7,6 +7,7 @@ import torch
 from .base import BasePolicy
 from ..gmflow import gmflow_posterior_mean_jit
 from lakonlab.ops.gmflow_ops.gmflow_ops import gm_temperature
+from lakonlab.ops import adaptive_grad_norm_split
 
 
 class GMFlowPolicy(BasePolicy):
@@ -32,6 +33,8 @@ class GMFlowPolicy(BasePolicy):
             sigma_t_src: torch.Tensor,
             checkpointing: bool = True,
             eps: float = 1e-6):
+        assert x_t_src.dim() in [4, 5], f'Invalid x_t_src shape: {x_t_src.shape}. Expected 4D or 5D tensor.'
+
         self.x_t_src = x_t_src
         self.ndim = x_t_src.dim()
         self.checkpointing = checkpointing
@@ -97,6 +100,15 @@ class GMFlowPolicy(BasePolicy):
         new_policy.sigma_t_src = self.sigma_t_src
         new_policy.denoising_output_x_0 = self.denoising_output_x_0.copy()
         return new_policy
+
+    def adaptive_grad_norm_split(self, ratio, min_scale=1e-4, max_scale=1e4):
+        main_output, aux_output = adaptive_grad_norm_split(
+            self.denoising_output_x_0, ratio, min_scale, max_scale)
+        main_policy = self.copy()
+        aux_policy = self.copy()
+        main_policy.denoising_output_x_0 = main_output
+        aux_policy.denoising_output_x_0 = aux_output
+        return main_policy, aux_policy
 
     def detach_(self):
         self.denoising_output_x_0 = {k: v.detach() for k, v in self.denoising_output_x_0.items()}

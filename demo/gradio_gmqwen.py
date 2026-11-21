@@ -47,8 +47,7 @@ def main():
         ).images[0]
 
     with gr.Blocks(analytics_enabled=False,
-                   title='pi-Qwen Demo',
-                   css_paths='lakonlab/ui/gradio/style.css'
+                   title='pi-Qwen Demo'
                    ) as demo:
 
         md_txt = '# pi-Qwen Demo\n\n' \
@@ -61,7 +60,7 @@ def main():
             prompt=DEFAULT_PROMPT,
             steps=4, guidance_scale=None,
             args=['last_seed', 'prompt', 'width', 'height', 'steps'])
-        demo.queue().launch(share=args.share)
+        demo.queue().launch(share=args.share, ssr_mode=False, css_paths='lakonlab/ui/gradio/style.css')
 
 
 if __name__ == "__main__":

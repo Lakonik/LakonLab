@@ -1,5 +1,6 @@
 import gradio as gr
-from .shared_opts import create_base_opts, create_generate_bar, set_seed, create_prompt_opts, create_image_size_bar
+from .shared_opts import (
+    create_base_opts, create_generate_bar, set_seed, create_prompt_opts, create_image_size_bar, create_output_image)
 
 
 def create_interface_img_edit(
@@ -9,7 +10,8 @@ def create_interface_img_edit(
         create_negative_prompt=False,
         create_prompt_rewrite=True, rewrite_prompt=False,
         args=['last_seed', 'prompt', 'in_image', 'width', 'height', 'steps', 'guidance_scale'],
-        rewrite_prompt_api=None, rewrite_prompt_args=['last_seed', 'prompt', 'rewrite_prompt', 'in_image']):
+        rewrite_prompt_api=None, rewrite_prompt_args=['last_seed', 'prompt', 'rewrite_prompt', 'in_image'],
+        output_quality='lossless'):
     var_dict = dict()
     with gr.Blocks(analytics_enabled=False) as interface:
         with gr.Row():
@@ -48,8 +50,9 @@ def create_interface_img_edit(
                     temperature=temperature)
 
             with gr.Column():
-                var_dict['output_image'] = gr.Image(
-                    type='pil', image_mode='RGB', label='Output image', interactive=False,
+                var_dict['output_image'] = create_output_image(
+                    type='pil', quality=output_quality,
+                    image_mode='RGB', label='Output image', interactive=False,
                     elem_classes=['vh-img', 'vh-img-1000'])
 
         if create_prompt_rewrite:
@@ -59,12 +62,12 @@ def create_interface_img_edit(
                 inputs=var_dict['seed'],
                 outputs=var_dict['last_seed'],
                 show_progress=False,
-                api_name=False
+                api_visibility='private'
             ).success(
                 fn=rewrite_prompt_api,
                 inputs=[var_dict[arg] for arg in rewrite_prompt_args],
                 outputs=[var_dict['rewritten_prompt'], var_dict['output_image']],
-                concurrency_id='default_group', api_name=False
+                concurrency_id='default_group', api_visibility='private'
             ).success(
                 fn=api,
                 inputs=[var_dict[arg] for arg in args],
@@ -77,7 +80,7 @@ def create_interface_img_edit(
                 inputs=var_dict['seed'],
                 outputs=var_dict['last_seed'],
                 show_progress=False,
-                api_name=False
+                api_visibility='private'
             ).success(
                 fn=api,
                 inputs=[var_dict[arg] for arg in args],

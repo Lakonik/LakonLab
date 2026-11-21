@@ -107,16 +107,6 @@ test_cfg = dict(
 data = dict(
     workers_per_gpu=4,
     train_dataloader=dict(samples_per_gpu=8),
-    test=dict(
-        type='ImagePrompt',
-        data_root='data/balancia_morgan_flux_embeds/',
-        cache_dir='',
-        cache_datalist_path='data/balancia_morgan_cache.json',
-        end_ind=128,
-        latent_size=(16, 96, 170),
-        repeat=2,
-        test_mode=True,
-    ),
     val_dataloader=dict(samples_per_gpu=1),
     test_dataloader=dict(samples_per_gpu=1),
     persistent_workers=True,
@@ -131,7 +121,7 @@ checkpoint_config = dict(
     out_dir='checkpoints/')
 
 evaluation = []
-for data_split in ['val2', 'test']:
+for data_split in ['val']:
     prefix = 'step4'
     evaluation.append(
         dict(

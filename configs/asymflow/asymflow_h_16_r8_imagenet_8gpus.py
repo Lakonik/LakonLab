@@ -191,5 +191,4 @@ ddp_kwargs = dict(
     find_unused_parameters=False,
     static_graph=True,
     gradient_as_bucket_view=True)
-cudnn_benchmark = True
 mp_start_method = 'fork'

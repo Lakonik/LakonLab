@@ -1,5 +1,6 @@
 import gradio as gr
-from .shared_opts import create_base_opts, create_generate_bar, set_seed, create_prompt_opts, create_image_size_bar
+from .shared_opts import (
+    create_base_opts, create_generate_bar, set_seed, create_prompt_opts, create_image_size_bar, create_output_image)
 
 
 def create_interface_text_to_img(
@@ -9,15 +10,19 @@ def create_interface_text_to_img(
         create_negative_prompt=False,
         create_prompt_rewrite=False, rewrite_prompt=False,
         args=['last_seed', 'prompt', 'width', 'height', 'steps', 'guidance_scale'],
-        rewrite_prompt_api=None, rewrite_prompt_args=['last_seed', 'prompt', 'rewrite_prompt']):
+        rewrite_prompt_api=None, rewrite_prompt_args=['last_seed', 'prompt', 'rewrite_prompt'],
+        output_quality='lossless',
+        min_height=64, max_height=2048, min_width=64, max_width=2048):
     var_dict = dict()
 
     def resolve_input(arg):
         return var_dict[arg] if isinstance(arg, str) else arg
 
     with gr.Blocks(analytics_enabled=False) as interface:
-        var_dict['output_image'] = gr.Image(
-            type='pil', image_mode='RGB', label='Output image', interactive=False, elem_classes=['vh-img', 'vh-img-700'])
+        var_dict['output_image'] = create_output_image(
+            type='pil', quality=output_quality,
+            image_mode='RGB', label='Output image', interactive=False,
+            elem_classes=['vh-img', 'vh-img-700'])
         create_prompt_opts(
             var_dict, create_negative_prompt=create_negative_prompt, prompt=prompt, negatove_prompt=negative_prompt)
         if create_prompt_rewrite:
@@ -28,7 +33,8 @@ def create_interface_text_to_img(
                     lines=4, interactive=False, show_label=False, container=False)
         with gr.Column(variant='compact', elem_classes=['custom-spacing']):
             create_image_size_bar(
-                var_dict, height=height, width=width, hw_slider_step=hw_slider_step)
+                var_dict, height=height, width=width, hw_slider_step=hw_slider_step,
+                min_height=min_height, max_height=max_height, min_width=min_width, max_width=max_width)
         create_generate_bar(var_dict, text='Generate', seed=seed)
         create_base_opts(
             var_dict,
@@ -46,12 +52,12 @@ def create_interface_text_to_img(
                 inputs=var_dict['seed'],
                 outputs=var_dict['last_seed'],
                 show_progress=False,
-                api_name=False
+                api_visibility='private'
             ).success(
                 fn=rewrite_prompt_api,
                 inputs=[resolve_input(arg) for arg in rewrite_prompt_args],
                 outputs=[var_dict['rewritten_prompt'], var_dict['output_image']],
-                concurrency_id='default_group', api_name=False
+                concurrency_id='default_group', api_visibility='private'
             ).success(
                 fn=api,
                 inputs=[resolve_input(arg) for arg in args],
@@ -64,7 +70,7 @@ def create_interface_text_to_img(
                 inputs=var_dict['seed'],
                 outputs=var_dict['last_seed'],
                 show_progress=False,
-                api_name=False
+                api_visibility='private'
             ).success(
                 fn=api,
                 inputs=[resolve_input(arg) for arg in args],

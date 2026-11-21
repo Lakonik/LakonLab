@@ -4,7 +4,7 @@
 
 We release the [prompt-only dataset](https://huggingface.co/datasets/Lakonik/t2i-prompts-3m) to reproduce the data-free training (without real images) in the paper. It is highly recommended to preprocess the prompts into prompt embeddings using the text encoder before training. Run the following command to preprocess the prompts using DDP on 1 node with 8 GPUs:
 ```bash
-torchrun --nnodes=1 --nproc_per_node=8 tools/cache_image_prompt_data.py configs/piqwen/gmqwen_k8_datafree_piid_4step_32gpus.py --text-encoder configs/piqwen/_text_encoder.py --max-size 2304128 --launcher pytorch --diff_seed
+torchrun --nnodes=1 --nproc_per_node=8 tools/datasets/cache_image_prompt_data.py configs/piqwen/gmqwen_k8_datafree_piid_4step_32gpus.py --text-encoder configs/piqwen/_text_encoder.py --max-size 2304128 --launcher pytorch --diff_seed
 ```
 By default, the preprocessed data will be saved to `data/t2i_prompts_3m/preproc_qwen/`, which requires 380GB of storage space. You can change the `data_root` in the [config file](_data_trainval.py) to save the data to a different location (AWS S3 URLs are supported).
 
@@ -25,7 +25,7 @@ The above config specifies a training batch size of 2 images per GPU, and the gr
 
 Before evaluation, run the following command to preprocess the evaluation prompts (similar to the [Before Training: Data Preparation](#before-training-data-preparation) step):
 ```bash
-torchrun --nnodes=1 --nproc_per_node=8 tools/cache_image_prompt_data.py configs/piqwen/gmqwen_k8_datafree_piid_4step_test.py --text-encoder configs/piqwen/_text_encoder.py --launcher pytorch --diff_seed
+torchrun --nnodes=1 --nproc_per_node=8 tools/datasets/cache_image_prompt_data.py configs/piqwen/gmqwen_k8_datafree_piid_4step_test.py --text-encoder configs/piqwen/_text_encoder.py --launcher pytorch --diff_seed
 ```
 
 Run the following command to evaluate a pretrained model (downloaded automatically) using DDP on 1 node with 8 GPUs:
@@ -45,7 +45,7 @@ To evaluate a custom checkpoint instead of the official model, we provide two op
 
 Run the export script to convert the checkpoint to diffusers safetensors:
 ```bash
-python tools/export_piflow_to_diffusers.py <PATH_TO_CONFIG> --ckpt <PATH_TO_CKPT> --out-dir <OUTPUT_DIR>
+python tools/checkpoints/export_piflow_to_diffusers.py <PATH_TO_CONFIG> --ckpt <PATH_TO_CKPT> --out-dir <OUTPUT_DIR>
 ```
 Then, modify the test config file to set `pretrained_adapter` to `<OUTPUT_DIR>/diffusion_pytorch_model.safetensors`. Finally, run the evaluation command as above.
 

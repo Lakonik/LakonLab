@@ -185,7 +185,7 @@ class UNet2DConditionModel(_UNet2DConditionModel):
     def forward(self, sample, timestep, encoder_hidden_states, **kwargs):
         dtype = sample.dtype
         return super().forward(
-            sample, timestep, encoder_hidden_states, return_dict=False, **kwargs)[0].to(dtype)
+            sample, timestep, encoder_hidden_states.to(dtype), return_dict=False, **kwargs)[0]
 
     def forward_enc(self, sample, timestep, encoder_hidden_states, **kwargs):
         return unet_enc(self, sample, timestep, encoder_hidden_states, **kwargs)

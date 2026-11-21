@@ -1,3 +1,7 @@
+"""Set BUILD_EXT=quant,gmflow_ops to build CUDA extensions."""
+
+import os
+
 from setuptools import find_packages, setup
 
 
@@ -91,6 +95,22 @@ def parse_requirements(fname='requirements.txt', with_version=True):
 
 
 if __name__ == '__main__':
+    ext_modules = []
+    cmdclass = {}
+    build_extensions = os.environ.get('BUILD_EXT', '')
+    if build_extensions:
+        import runpy
+        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+        cmdclass['build_ext'] = BuildExtension
+        for name in build_extensions.split(','):
+            name = name.strip()
+            if name not in ('quant', 'gmflow_ops'):
+                raise ValueError(f'Unknown CUDA extension: {name}')
+            config = runpy.run_path(f'lakonlab/ops/{name}/_build.py')['get_build_config']()
+            config['sources'] = [os.path.relpath(source) for source in config['sources']]
+            ext_modules.append(CUDAExtension(name=f'lakonlab.ops.{name}._C', **config))
+
     setup(
         name='lakonlab',
         version=get_version(),
@@ -100,7 +120,22 @@ if __name__ == '__main__':
         author='Hansheng Chen',
         author_email='hanshengchen97@gmail.com',
         packages=find_packages(exclude=('configs', 'data', 'tools', 'demo', 'work_dirs')),
-        license='MIT License',
+        license='Apache-2.0',
         include_package_data=True,
+        package_data={
+            'lakonlab.ops.gmflow_ops': ['src/*.cu', 'src/*.cpp', 'src/*.h'],
+            'lakonlab.ops.quant': ['src/*.cu', 'src/*.cpp', 'src/*.h'],
+            'lakonlab.ops.sol_attn': [
+                'UPSTREAM.md', 'THIRD_PARTY_NOTICES.md', 'LICENSE.sana',
+                'sm100/LICENSE.flash-attention', 'sm120/LICENSE.cudnn'],
+        },
+        ext_modules=ext_modules,
+        cmdclass=cmdclass,
         install_requires=parse_requirements('requirements.txt'),
+        extras_require={
+            'sol': ['nvidia-cutlass-dsl>=4.5', 'cuda-bindings>=12.8', 'apache-tvm-ffi>=0.1.15'],
+            'gmuon': [
+                'gram-newton-schulz @ git+https://github.com/nanovisionx/gmuon.git@'
+                '4863cc2446f09a54d937c579d4e775c125f5ab2e'],
+        },
         zip_safe=False)

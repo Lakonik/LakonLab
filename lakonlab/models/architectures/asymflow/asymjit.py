@@ -20,6 +20,7 @@ class AsymJiT(AsymFlowMixin, _JiT):
             basis_rank: int = 32,
             sigma_min: float = 1e-4,
             num_timesteps=1,
+            use_calibration: bool = True,
             freeze=False,
             freeze_exclude=[],
             pretrained=None,
@@ -43,7 +44,7 @@ class AsymJiT(AsymFlowMixin, _JiT):
         self.basis_rank = basis_rank
         self.num_timesteps = num_timesteps
         self.sigma_min = sigma_min
-        self.init_asymflow_buffers(in_channels * (patch_size ** 2), basis_rank)
+        self.init_asymflow_buffers(in_channels * (patch_size ** 2), basis_rank, use_calibration=use_calibration)
 
         self.init_weights(pretrained, pretrained_linear_proj)
 
@@ -71,7 +72,20 @@ class AsymJiT(AsymFlowMixin, _JiT):
         logger = get_root_logger()
 
         if pretrained is not None:
-            state_dict = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
+            checkpoint = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+
+            if self.secondary_emb_start_layer is not None:
+                secondary_emb_state_dict = dict()
+                for k, v in state_dict.items():
+                    if k.startswith(('t_embedder', 'y_embedder')):
+                        secondary_k = 'secondary_' + k
+                        if secondary_k not in state_dict:
+                            secondary_emb_state_dict[secondary_k] = v  # no need to clone since assign=False
+                state_dict.update(secondary_emb_state_dict)
 
             if pretrained_linear_proj is not None:
                 raise NotImplementedError
@@ -174,19 +188,23 @@ class AsymJiT(AsymFlowMixin, _JiT):
 
         # scale and timestep calibration
         calibration = self.asymflow_calibration(timestep, bs, packed_ndim)
-        hidden_states = x_t * calibration.k.reshape(bs, *((ndim - 1) * [1])).to(x_t.dtype)
+        if self.use_calibration:
+            hidden_states = x_t * calibration.k.reshape(bs, *((ndim - 1) * [1])).to(x_t.dtype)
+        else:
+            hidden_states = x_t
 
         u_a_packed = super().forward(
             hidden_states,
             calibration.timestep,
             class_labels=class_labels,
             unpatchify_output=False,
+            fp32_final_layer=True,
             **kwargs)
 
         output_packed = self.asymflow_velocity(u_a_packed, x_t_packed, calibration)
 
         output = self.unpatchify(self.unpack(
-            output_packed.to(x_t.dtype),
+            output_packed,
             h // self.patch_size, w // self.patch_size
         ), self.patch_size)
         return output

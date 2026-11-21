@@ -11,7 +11,8 @@ from mmcv.parallel import collate
 from mmcv.runner import get_dist_info
 from mmcv.utils import TORCH_VERSION, Registry, build_from_cfg, digit_version
 
-from .samplers import DistributedSampler
+from .base import shared_parse_cache
+from .samplers import DistributedBucketBatchSampler, DistributedSampler
 
 if platform.system() != 'Windows':
     # https://github.com/pytorch/pytorch/issues/973
@@ -23,6 +24,10 @@ if platform.system() != 'Windows':
     resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
 
 DATASETS = Registry('dataset')
+
+
+def variable_batch_collate(batch):
+    return collate(batch, samples_per_gpu=len(batch))
 
 
 def unique_dataloaders(data_loaders):
@@ -47,41 +52,20 @@ def build_dataset(cfg, default_args=None):
     Returns:
         Object: Dataset for sampling data batch.
     """
-    dataset = build_from_cfg(cfg, DATASETS, default_args)
+    with shared_parse_cache():  # the datasets of a ConcatDataset parse their shared files once
+        dataset = build_from_cfg(cfg, DATASETS, default_args)
 
     return dataset
 
 
 def build_dataloader(dataset,
-                     samples_per_gpu,
-                     workers_per_gpu,
-                     num_gpus=1,
-                     dist=True,
+                     samples_per_gpu=None,
+                     workers_per_gpu=1,
                      shuffle=True,
                      seed=None,
                      persistent_workers=False,
-                     sampler=None,
                      **kwargs):
     rank, world_size = get_dist_info()
-    if dist:
-        assert sampler is None, 'sampler is not supported in distributed mode'
-        sampler = DistributedSampler(
-            dataset,
-            world_size,
-            rank,
-            shuffle=shuffle,
-            samples_per_gpu=samples_per_gpu,
-            seed=seed)
-        shuffle = False
-        batch_size = samples_per_gpu
-        num_workers = workers_per_gpu
-    else:
-        batch_size = num_gpus * samples_per_gpu
-        num_workers = num_gpus * workers_per_gpu
-
-    init_fn = partial(
-        worker_init_fn, num_workers=num_workers, rank=rank,
-        seed=seed) if seed is not None else None
 
     if (digit_version(TORCH_VERSION) >= digit_version('1.7.0')
             and TORCH_VERSION != 'parrots'):
@@ -90,15 +74,44 @@ def build_dataloader(dataset,
         warnings.warn('persistent_workers is invalid because your pytorch '
                       'version is lower than 1.7.0')
 
-    data_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
-        shuffle=shuffle,
-        worker_init_fn=init_fn,
-        **kwargs)
+    init_fn = partial(
+        worker_init_fn, num_workers=workers_per_gpu, rank=rank,
+        seed=seed) if seed is not None else None
+
+    if hasattr(dataset, 'bucket_samples_per_gpu'):
+        batch_sampler = DistributedBucketBatchSampler(
+            dataset,
+            world_size,
+            rank,
+            shuffle=shuffle,
+            seed=seed)
+        data_loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=workers_per_gpu,
+            collate_fn=variable_batch_collate,
+            worker_init_fn=init_fn,
+            **kwargs)
+
+    else:
+        if samples_per_gpu is None:
+            raise ValueError('samples_per_gpu is required when bucket_samples_per_gpu is not set.')
+        sampler = DistributedSampler(
+            dataset,
+            world_size,
+            rank,
+            shuffle=shuffle,
+            samples_per_gpu=samples_per_gpu,
+            seed=seed)
+        data_loader = DataLoader(
+            dataset,
+            batch_size=samples_per_gpu,
+            sampler=sampler,
+            num_workers=workers_per_gpu,
+            collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
+            shuffle=False,
+            worker_init_fn=init_fn,
+            **kwargs)
 
     return data_loader
 

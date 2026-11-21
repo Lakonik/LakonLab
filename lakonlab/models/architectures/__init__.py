@@ -6,3 +6,5 @@ from .autoencoders import *
 from .lightningdit import *
 from .asymflow import *
 from .transformers import *
+from .dwd_head import ConvRefiner
+from .sol_h3 import SolH3DWDHead

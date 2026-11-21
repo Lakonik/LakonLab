@@ -1,16 +1,32 @@
 # Copyright (c) 2026 Hansheng Chen
 
-import mmcv
-import torch
-
 from copy import deepcopy
-try:
-    from torch.distributed.fsdp import FSDPModule
-except:
-    FSDPModule = None
+
+import torch
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor
+
+import mmcv
 from mmcv.parallel import is_module_wrapper
 from mmcv.runner import HOOKS, Hook
 from lakonlab.utils import rgetattr, rhasattr
+
+from ..optimizer.stiefel_adamw import _qr_retract
+
+
+def _local_pair(net_data, ema_data):
+    """Return the tensors to run the (elementwise) EMA update on, or (None, None) to fall back.
+
+    Foreach ops have no DTensor sharding strategy, so FSDP2 params are updated on their
+    local shards, which is exact when net and EMA share the same mesh and placements.
+    """
+    if isinstance(net_data, DTensor) or isinstance(ema_data, DTensor):
+        if not (isinstance(net_data, DTensor) and isinstance(ema_data, DTensor)
+                and net_data.device_mesh == ema_data.device_mesh
+                and net_data.placements == ema_data.placements):
+            return None, None
+        return net_data.to_local(), ema_data.to_local()
+    return net_data, ema_data
 
 
 def get_ori_key(key):
@@ -98,28 +114,35 @@ class ExponentialMovingAverageHook(Hook):
             grouped_params = {}
             fallback_params = []
             for p_net, p_ema in zip(net.parameters(), ema.parameters()):
-                if not self.foreach or p_net.data.device != p_ema.data.device or p_net.data.dtype != p_ema.data.dtype:
+                net_data, ema_data = _local_pair(p_net.data, p_ema.data)
+                if not self.foreach or net_data is None or net_data.device != ema_data.device or net_data.dtype != ema_data.dtype:
                     fallback_params.append((p_net, p_ema))
                     continue
-                group_key = (p_net.requires_grad, p_net.data.device, p_net.data.dtype)
+                group_key = (p_net.requires_grad, net_data.device, net_data.dtype)
                 if group_key not in grouped_params:
                     grouped_params[group_key] = ([], [])
-                grouped_params[group_key][0].append(p_net.data)
-                grouped_params[group_key][1].append(p_ema.data)
+                grouped_params[group_key][0].append(net_data)
+                grouped_params[group_key][1].append(ema_data)
             cache['grouped_params'] = grouped_params
             cache['fallback_params'] = fallback_params
+            cache['stiefel_params'] = [
+                p_ema for p_net, p_ema in zip(net.parameters(), ema.parameters())
+                if getattr(p_net, 'lakonlab_stiefel', False) or getattr(p_ema, 'lakonlab_stiefel', False)]
 
             grouped_buffers = {}
             fallback_buffers = []
             for b_net, b_ema in zip(net.buffers(), ema.buffers()):
-                if not self.foreach or b_net.data.device != b_ema.data.device or b_net.data.dtype != b_ema.data.dtype:
+                if getattr(b_net, 'lakonlab_ema_ignore', False) or getattr(b_ema, 'lakonlab_ema_ignore', False):
+                    continue
+                net_data, ema_data = _local_pair(b_net.data, b_ema.data)
+                if not self.foreach or net_data is None or net_data.device != ema_data.device or net_data.dtype != ema_data.dtype:
                     fallback_buffers.append((b_net, b_ema))
                     continue
-                group_key = (b_net.data.device, b_net.data.dtype)
+                group_key = (net_data.device, net_data.dtype)
                 if group_key not in grouped_buffers:
                     grouped_buffers[group_key] = ([], [])
-                grouped_buffers[group_key][0].append(b_net.data)
-                grouped_buffers[group_key][1].append(b_ema.data)
+                grouped_buffers[group_key][0].append(net_data)
+                grouped_buffers[group_key][1].append(ema_data)
             cache['grouped_buffers'] = grouped_buffers
             cache['fallback_buffers'] = fallback_buffers
 
@@ -236,6 +259,13 @@ class ExponentialMovingAverageHook(Hook):
 
                 for b_net, b_ema in cache['fallback_buffers']:
                     b_ema.data.copy_(b_net.data)
+
+                # lerping orthonormal matrices drifts off the Stiefel manifold (second-order
+                # in the basis step), so retract flagged params; skipped in the pre-start
+                # copy phase, where the source is already on-manifold
+                if runner.iter >= self.start_iter:
+                    for p_ema in cache['stiefel_params']:
+                        p_ema.data.copy_(_qr_retract(p_ema.data.float()))
 
     def before_run(self, runner):
         model = runner.model.module if is_module_wrapper(

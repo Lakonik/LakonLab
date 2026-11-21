@@ -16,9 +16,12 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
         use_affine_norm=True,
         mean=(0.5, 0.0, 0.0),
         std=0.21,
+        torch_dtype='float32',
+        eps=1e-6,
     ):
         super().__init__()
         self.use_affine_norm = use_affine_norm
+        self.eps = eps
         self.register_buffer('lrgb_to_lms', torch.tensor([
             [0.4122214708, 0.5363325363, 0.0514459929],
             [0.2119034982, 0.6806995451, 0.1073969566],
@@ -34,6 +37,8 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
         if self.use_affine_norm:
             self.register_buffer('affine_mean', torch.tensor(mean, dtype=torch.float32))
             self.register_buffer('affine_std', torch.tensor(std, dtype=torch.float32))
+        if torch_dtype is not None:
+            self.to(getattr(torch, torch_dtype))
 
     @property
     def dtype(self):
@@ -49,12 +54,14 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
 
     @staticmethod
     def lrgb_to_srgb(lrgb):
-        lrgb = lrgb.clamp(min=0)
         a = 0.055
+        linear = lrgb.clamp(min=0).mul_(12.92)
+        nonlinear = lrgb.clamp(min=0.0031308).pow_(1 / 2.4).mul_(1 + a).sub_(a)
+        # where(out=...) reuses private storage for inference but does not support autograd.
         return torch.where(
             lrgb <= 0.0031308,
-            lrgb * 12.92,
-            (1 + a) * (lrgb.clamp(min=0.0031308) ** (1 / 2.4)) - a)
+            linear, nonlinear,
+            out=None if torch.is_grad_enabled() else nonlinear)
 
     def lrgb_to_oklab(self, lrgb):
         """
@@ -62,7 +69,10 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
             lrgb (torch.Tensor): Linear RGB, shape (N, 3, *)
         """
         lms = torch.einsum('ij,bj...->bi...', self.lrgb_to_lms, lrgb).clamp(min=0)
-        oklab = torch.einsum('ij,bj...->bi...', self.lms_to_oklab, lms.pow(1/3))
+        eps = self.eps
+        # Linear near zero to keep black exact and its encoding gradient finite.
+        lms_root = torch.where(lms < eps, lms * eps ** (-2 / 3), lms.clamp(min=eps).pow(1/3))
+        oklab = torch.einsum('ij,bj...->bi...', self.lms_to_oklab, lms_root)
         return oklab
 
     def oklab_to_lrgb(self, oklab):
@@ -70,9 +80,14 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
         Args:
             oklab (torch.Tensor): Oklab, shape (N, 3, *)
         """
-        lms = torch.einsum('ij,bj...->bi...', self.oklab_to_lms, oklab).pow(3)
+        lms = torch.einsum('ij,bj...->bi...', self.oklab_to_lms, oklab)
+        lms = torch.where(
+            (lms >= 0) & (lms < self.eps ** (1 / 3)),
+            lms * self.eps ** (2 / 3),
+            lms.pow(3),
+            out=None if torch.is_grad_enabled() else lms)
         lrgb = torch.einsum('ij,bj...->bi...', self.lms_to_lrgb, lms)
-        return lrgb.clamp(0, 1)
+        return lrgb.clamp_(0, 1)
 
     def encode(self, img):
         rgb = img / 2 + 0.5
@@ -90,10 +105,11 @@ class OklabColorEncoder(ModelMixin, ConfigMixin):
             n_dim = oklab.dim() - 2
             mean = self.affine_mean.reshape(-1, *([1] * n_dim))
             std = self.affine_std.reshape(-1, *([1] * n_dim))
-            oklab = oklab * std + mean
-        lrgb = self.oklab_to_lrgb(oklab)
-        rgb = self.lrgb_to_srgb(lrgb)
-        img = rgb * 2 - 1
+            oklab = (oklab * std).add_(mean)
+        img = self.oklab_to_lrgb(oklab)
+        del oklab
+        img = self.lrgb_to_srgb(img)
+        img.mul_(2).sub_(1)
         return img
 
 
@@ -125,7 +141,8 @@ class RGBColorEncoder(ModelMixin, ConfigMixin):
             n_dim = img.dim() - 2
             mean = self.affine_mean.reshape(-1, *([1] * n_dim))
             std = self.affine_std.reshape(-1, *([1] * n_dim))
-            img = (img - mean) / std
+            img = img - mean
+            img = img.div_(std) if torch.broadcast_shapes(img.shape, std.shape) == img.shape else img / std
         return img
 
     def decode(self, img):
@@ -133,5 +150,9 @@ class RGBColorEncoder(ModelMixin, ConfigMixin):
             n_dim = img.dim() - 2
             mean = self.affine_mean.reshape(-1, *([1] * n_dim))
             std = self.affine_std.reshape(-1, *([1] * n_dim))
-            img = img * std + mean
-        return img.clamp(min=-1, max=1)
+            img = img * std
+            img = img.add_(mean) if torch.broadcast_shapes(img.shape, mean.shape) == img.shape else img + mean
+            img.clamp_(min=-1, max=1)
+        else:
+            img = img.clamp(min=-1, max=1)
+        return img

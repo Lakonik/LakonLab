@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
-from diffusers.models.embeddings import get_2d_sincos_pos_embed
 from mmcv.cnn import constant_init, xavier_init
 
 from ..diffusers.dit import LabelEmbeddingMod
 from .modules import (
+    BottleneckPatchEmbed,
     FinalLayer,
     LightningDiTBlock,
     VisionRotaryEmbeddingFast,
@@ -12,36 +12,10 @@ from .modules import (
     TimestepEmbedder,
 )
 from ...builder import MODULES
-from ..utils import flex_freeze
+from ..dwd_head import DWDHeadMixin
+from ..utils import flex_freeze, fp32_module_forward
 from lakonlab.runner.checkpoint import _load_cached_checkpoint, load_full_state_dict
 from lakonlab.utils import get_root_logger
-
-
-class BottleneckPatchEmbed(nn.Module):
-    def __init__(self, img_size=256, patch_size=16, in_chans=3, pca_dim=128, embed_dim=768, bias=True):
-        super().__init__()
-        self.img_size = (img_size, img_size)
-        self.patch_size = (patch_size, patch_size)
-        grid_size = img_size // patch_size
-        self.num_patches = grid_size ** 2
-
-        self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
-        self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
-
-        pos_embed = get_2d_sincos_pos_embed(
-            embed_dim,
-            grid_size,
-            base_size=grid_size,
-            output_type='pt')
-        self.register_buffer('pos_embed', pos_embed.float().unsqueeze(0))
-
-    def forward(self, x):
-        _, _, height, width = x.shape
-        if (height, width) != self.img_size:
-            raise ValueError(
-                f'Input image size {(height, width)} does not match model image size {self.img_size}.')
-        latent = self.proj2(self.proj1(x)).flatten(2).transpose(1, 2)
-        return (latent + self.pos_embed).to(latent.dtype)
 
 
 class JiTVisionRotaryEmbedding(nn.Module):
@@ -77,7 +51,8 @@ class JiTVisionRotaryEmbedding(nn.Module):
         return x * freqs_cos + rotate_half(x) * freqs_sin
 
 
-class _JiT(nn.Module):
+class _JiT(DWDHeadMixin, nn.Module):
+
     _cache_storage = dict()
 
     def __init__(
@@ -87,6 +62,8 @@ class _JiT(nn.Module):
             in_channels=3,
             hidden_size=768,
             depth=12,
+            secondary_emb_start_layer=None,
+            dwd_head_config=None,
             num_heads=12,
             mlp_ratio=4.0,
             num_classes=1000,
@@ -120,18 +97,31 @@ class _JiT(nn.Module):
             use_cfg_embedding=True,
         )
         self.x_embedder = BottleneckPatchEmbed(
-            img_size=self.input_size,
+            height=self.input_size,
+            width=self.input_size,
             patch_size=self.patch_size,
-            in_chans=self.in_channels,
-            pca_dim=self.bottleneck_dim,
+            in_channels=self.in_channels,
+            bottleneck_dim=self.bottleneck_dim,
             embed_dim=self.hidden_size,
             bias=True,
+            # forcing persistent pos_embed, since pretrained models may incorrectly use learnable pos_embed
+            pos_embed_max_size=self.input_size // self.patch_size,
         )
         if self.in_context_len > 0:
             self.in_context_posemb = nn.Parameter(torch.zeros(1, self.in_context_len, self.hidden_size))
             torch.nn.init.normal_(self.in_context_posemb, std=0.02)
         else:
             self.in_context_posemb = None
+        self.secondary_emb_start_layer = secondary_emb_start_layer
+        if self.secondary_emb_start_layer is not None:
+            assert 0 <= self.secondary_emb_start_layer < self.depth
+            self.secondary_t_embedder = TimestepEmbedder(self.hidden_size)
+            self.secondary_y_embedder = LabelEmbeddingMod(
+                self.num_classes,
+                self.hidden_size,
+                dropout_prob=0.0,
+                use_cfg_embedding=True,
+            )
 
         head_dim = self.hidden_size // self.num_heads
         rope_dim = head_dim // 2
@@ -162,11 +152,11 @@ class _JiT(nn.Module):
         self.final_layer = FinalLayer(
             self.hidden_size, self.patch_size, self.out_channels, use_rmsnorm=True)
 
-        self.gradient_checkpointing = checkpointing
+        # Optional DWD heads
+        if dwd_head_config is not None:
+            self.init_dwd_head(self.hidden_size, **dwd_head_config)
 
-    @property
-    def dtype(self):
-        return next(self.parameters()).dtype
+        self.gradient_checkpointing = checkpointing
 
     def get_cache_hidden_states(self):
         return self._cache_storage['x']
@@ -175,6 +165,8 @@ class _JiT(nn.Module):
         self._cache_storage.clear()
 
     def init_weights(self):
+        super().init_weights()
+
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 xavier_init(m, distribution='uniform')
@@ -185,9 +177,16 @@ class _JiT(nn.Module):
         nn.init.xavier_uniform_(proj2_weight.view(proj2_weight.shape[0], -1))
         nn.init.zeros_(self.x_embedder.proj2.bias)
 
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        for y_embedder in [self.y_embedder, getattr(self, 'secondary_y_embedder', None)]:
+            if y_embedder is None:
+                continue
+            nn.init.normal_(y_embedder.embedding_table.weight, std=0.02)
+
+        for t_embedder in [self.t_embedder, getattr(self, 'secondary_t_embedder', None)]:
+            if t_embedder is None:
+                continue
+            nn.init.normal_(t_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(t_embedder.mlp[2].weight, std=0.02)
 
         for block in self.blocks:
             constant_init(block.adaLN_modulation[-1], val=0)
@@ -195,22 +194,50 @@ class _JiT(nn.Module):
         constant_init(self.final_layer.adaLN_modulation[-1], val=0)
         constant_init(self.final_layer.linear, val=0)
 
-    def _apply_blocks(self, x, cond, label_emb, cache_mode=None, cache_config=None):
+    def forward(
+            self,
+            x,
+            timestep,
+            class_labels=None,
+            cache_mode=None,
+            cache_config=None,
+            unpatchify_output=True,
+            return_features=False,
+            fp32_final_layer=False):
+        bs, _, h, w = x.size()
+        height, width = h // self.patch_size, w // self.patch_size
+
         if cache_mode is not None:
             cache_after_block = cache_config['cache_after_block']
+            if self.secondary_emb_start_layer is not None:
+                assert cache_after_block < self.secondary_emb_start_layer
 
-        start_block = 0
         if cache_mode == 'load':
+            x = self._cache_storage.pop('x')[-bs:]
+            label_emb = self._cache_storage.pop('label_emb')[-bs:]
+            cond = self._cache_storage.pop('cond')[-bs:]
             start_block = cache_after_block + 1
+        else:
+            x = self.x_embedder(x)
+            timestep_emb = self.t_embedder(timestep)
+            label_emb = self.y_embedder(class_labels)
+            cond = timestep_emb + label_emb
+            start_block = 0
 
-        for block_id in range(start_block, len(self.blocks)):
-            block = self.blocks[block_id]
+        for index_block in range(start_block, len(self.blocks)):
+            # Update emb when we reach the specified block
+            if index_block == self.secondary_emb_start_layer:
+                timestep_emb = self.secondary_t_embedder(timestep)
+                label_emb = self.secondary_y_embedder(class_labels)
+                cond = timestep_emb + label_emb
 
-            if self.in_context_len > 0 and block_id == self.in_context_start:
+            block = self.blocks[index_block]
+
+            if self.in_context_len > 0 and index_block == self.in_context_start:
                 in_context_tokens = label_emb.unsqueeze(1).expand(-1, self.in_context_len, -1)
                 in_context_tokens = in_context_tokens + self.in_context_posemb
                 x = torch.cat([in_context_tokens, x], dim=1)
-            rope = self.feat_rope if block_id < self.in_context_start else self.feat_rope_incontext
+            rope = self.feat_rope if index_block < self.in_context_start else self.feat_rope_incontext
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
@@ -221,44 +248,18 @@ class _JiT(nn.Module):
             else:
                 x = block(x, cond, rope)
 
-            if cache_mode == 'save' and block_id == cache_after_block:
+            if cache_mode == 'save' and index_block == cache_after_block:
                 self._cache_storage['x'] = x
                 self._cache_storage['label_emb'] = label_emb
                 self._cache_storage['cond'] = cond
 
-        return x
-
-    def forward(
-            self,
-            x,
-            timestep,
-            class_labels=None,
-            cache_mode=None,
-            cache_config=None,
-            unpatchify_output=True):
-        bs, _, h, w = x.size()
-        height, width = h // self.patch_size, w // self.patch_size
-
-        if cache_mode == 'load':
-            x = self._cache_storage.pop('x')[-bs:]
-            label_emb = self._cache_storage.pop('label_emb')[-bs:]
-            cond = self._cache_storage.pop('cond')[-bs:]
-        else:
-            x = self.x_embedder(x)
-            timestep_emb = self.t_embedder(timestep)
-            label_emb = self.y_embedder(class_labels)
-            cond = timestep_emb + label_emb
-
-        x = self._apply_blocks(
-            x,
-            cond,
-            label_emb,
-            cache_mode=cache_mode,
-            cache_config=cache_config)
         if self.in_context_len > 0:
             x = x[:, self.in_context_len:]
 
-        output = self.final_layer(x, cond)
+        output = fp32_module_forward(
+            self.final_layer, x, cond, return_features=return_features, enabled=fp32_final_layer)
+        if return_features:
+            output, features = output
 
         if unpatchify_output:
             output = output.reshape(
@@ -266,7 +267,7 @@ class _JiT(nn.Module):
             ).permute(0, 5, 1, 3, 2, 4).reshape(
                 bs, self.out_channels, height * self.patch_size, width * self.patch_size)
 
-        return output
+        return (output, features) if return_features else output
 
 
 @MODULES.register_module()
@@ -277,6 +278,7 @@ class JiT(_JiT):
             freeze=False,
             freeze_exclude=[],
             pretrained=None,
+            pretrained_dwd_head=None,
             torch_dtype='float32',
             compile_forward=False,
             compile_kwargs=dict(
@@ -289,7 +291,7 @@ class JiT(_JiT):
             **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.init_weights(pretrained)
+        self.init_weights(pretrained, pretrained_dwd_head)
 
         if autocast_dtype is not None:
             assert torch_dtype == 'float32'
@@ -311,19 +313,46 @@ class JiT(_JiT):
         if compile_forward:
             self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
 
-    def init_weights(self, pretrained=None):
+    def init_weights(self, pretrained=None, pretrained_dwd_head=None):
+        super().init_weights()
+
         if pretrained is not None:
             logger = get_root_logger()
-            state_dict = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
+            checkpoint = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+
+            if self.secondary_emb_start_layer is not None:
+                secondary_emb_state_dict = dict()
+                for k, v in state_dict.items():
+                    if k.startswith(('t_embedder', 'y_embedder')):
+                        secondary_k = 'secondary_' + k
+                        if secondary_k not in state_dict:
+                            secondary_emb_state_dict[secondary_k] = v  # no need to clone since assign=False
+                state_dict.update(secondary_emb_state_dict)
+
+            if pretrained_dwd_head is not None:
+                state_dict.update(_load_cached_checkpoint(
+                    pretrained_dwd_head, map_location='cpu', logger=logger))
+
             load_full_state_dict(self, state_dict, logger=logger)
 
-        else:
-            super().init_weights()
+    def _forward_impl(self, x, return_pixels=False, return_features=False, **kwargs):
+        output = super().forward(x, return_features=return_pixels or return_features, **kwargs)
+        auxiliary_output = None
+        if return_pixels or return_features:
+            output, auxiliary_output = output
+        if return_pixels:
+            h, w = x.shape[-2:]
+            auxiliary_output = self.forward_dwd_head(
+                auxiliary_output, (h // self.patch_size, w // self.patch_size))
+        return output, auxiliary_output
 
-    def _forward_impl(self, *args, **kwargs):
-        return super().forward(*args, **kwargs)
-
-    def forward(self, x, timestep, class_labels=None, **kwargs):
+    def forward(self, x, timestep, class_labels=None,
+                return_pixels=False, return_features=False, **kwargs):
+        class_labels = class_labels[-x.size(0):]
         if self.autocast_dtype is not None:
             dtype = getattr(torch, self.autocast_dtype)
         else:
@@ -332,6 +361,11 @@ class JiT(_JiT):
                 device_type='cuda',
                 enabled=self.autocast_dtype is not None,
                 dtype=dtype if self.autocast_dtype is not None else None):
-            if self._compiled_forward is not None:
-                return self._compiled_forward(x.to(dtype), timestep, class_labels=class_labels, **kwargs)
-            return self._forward_impl(x.to(dtype), timestep, class_labels=class_labels, **kwargs)
+            forward_fn = self._forward_impl if self._compiled_forward is None else self._compiled_forward
+            output, auxiliary_output = forward_fn(
+                x.to(dtype), timestep=timestep, class_labels=class_labels,
+                return_pixels=return_pixels, return_features=return_features, **kwargs)
+        if return_pixels or return_features:
+            return output, auxiliary_output
+        else:
+            return output

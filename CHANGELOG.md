@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.0] - 2026-11-20
+
+### Added
+- pi-H3 video and audio generation in 2 or 4 steps, with Sol sparse attention.
+- 8-bit quantization of frozen layers for faster training and inference.
+- VBench and LongText-Bench evaluation, and the warping error metric for videos.
+- Video and audio support for evaluation and the media viewer.
+- Optional GMuon optimizer (install with the `gmuon` extra).
+- Various training infrastructure upgrades.
+
+### Changed
+- **Breaking:** Require PyTorch 2.9+, Diffusers 0.40.0, and Transformers 5.16.1. Please re-install LakonLab.
+- **Breaking:** Move tools into `tools/datasets/`, `tools/checkpoints/`, and `tools/fitting/`.
+- **Breaking:** Custom metrics now receive images in [0, 1] instead of [-1, 1].
+- The `cudnn_benchmark` config key is no longer used. Set `global_config = {'torch.backends.cudnn.benchmark': False}` to disable cuDNN benchmarking.
+- Reduce memory usage of large datasets.
+
+### Fixed
+- Fix second-order GMFlow sampling with guidance disabled.
+- Fix training randomness being affected by evaluation.
+- Fix resuming FSDP2 training.
+- Fix HPSv3 evaluation with batch size > 1 in distributed runs, and concurrent VQAScore model downloads.
+- Fix S3 access from forked dataloader workers.
+
 ## [0.2.2] - 2026-07-13
 
 ### Added
@@ -73,7 +97,7 @@
 - Fix a bug with guidance interval.
 - Fix `tools/train.py` crashing when using `--launcher slurm`.
 - Fix a bug in `tools/test.py` that caused the flag `--reuse-viz` to have no effect.
-- Fix a bug when running `tools/cache_image_prompt_data.py` with `--skip-existing` flag in distributed mode.
+- Fix a bug when running `tools/datasets/cache_image_prompt_data.py` with `--skip-existing` flag in distributed mode.
 - Fix several bugs that could cause distributed runs to hang due to I/O synchronization issues.
 - Fix a bug that visualization images may not be saved in certain file systems due to unsupported filenames.
 - Fix a version compatibility issue in the example GMDiT script in `configs/gmflow/README.md`.

@@ -131,5 +131,4 @@ dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
 resume_from = None
-cudnn_benchmark = True
 mp_start_method = 'fork'

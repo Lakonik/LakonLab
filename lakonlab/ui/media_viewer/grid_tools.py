@@ -6,7 +6,7 @@ import os
 import pathlib
 from urllib.parse import urlparse, urljoin, quote
 from bs4 import BeautifulSoup
-from mmcv.fileio import FileClient
+from lakonlab.utils.io_utils import FileClient
 
 
 ASSET_DIR = pathlib.Path(__file__).parent

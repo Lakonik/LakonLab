@@ -73,8 +73,7 @@ def main():
         ).images[0]
 
     with gr.Blocks(analytics_enabled=False,
-                   title='pi-FLUX Demo',
-                   css_paths='lakonlab/ui/gradio/style.css'
+                   title='pi-FLUX Demo'
                    ) as demo:
 
         md_txt = '# pi-FLUX Demo\n\n' \
@@ -88,7 +87,7 @@ def main():
             prompt=DEFAULT_PROMPT,
             steps=4, min_steps=4, max_steps=8, steps_slider_step=4, guidance_scale=None,
             args=['last_seed', 'prompt', 'width', 'height', 'steps'])
-        demo.queue().launch(share=args.share)
+        demo.queue().launch(share=args.share, ssr_mode=False, css_paths='lakonlab/ui/gradio/style.css')
 
 
 if __name__ == "__main__":

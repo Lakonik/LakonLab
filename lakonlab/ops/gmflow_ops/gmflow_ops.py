@@ -9,21 +9,7 @@ import torch
 from torch.autograd import Function
 from torch.amp import custom_fwd
 
-BACKEND = None
-
-
-def get_backend():
-    global BACKEND
-
-    if BACKEND is None:
-        try:
-            import _gmflow_ops as _backend
-        except ImportError:
-            from .backend import _backend
-
-        BACKEND = _backend
-
-    return BACKEND
+from .._extension import get_backend
 
 
 class _gm1d_inverse_cdf(Function):
@@ -43,7 +29,7 @@ class _gm1d_inverse_cdf(Function):
 
         samples = init_samples.expand(*batch_shapes, n_samples, h, w).reshape(
             batch_numel, n_samples, h, w).contiguous()
-        get_backend().gm1d_inverse_cdf(
+        get_backend(__package__).gm1d_inverse_cdf(
             means.expand(*batch_shapes, num_gaussians, h, w).reshape(
                 batch_numel, num_gaussians, h, w).contiguous(),
             logstds.expand(*batch_shapes, 1, 1, 1).reshape(

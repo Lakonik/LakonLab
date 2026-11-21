@@ -56,7 +56,7 @@ class Qwen3VLPromptRewriter:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            padding=True,
+            processor_kwargs=dict(padding=True),
         )
         inputs.pop("token_type_ids", None)
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}

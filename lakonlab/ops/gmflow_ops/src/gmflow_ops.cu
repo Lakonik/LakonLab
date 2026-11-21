@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Hansheng Chen
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -157,7 +160,9 @@ void gm1d_inverse_cdf(
     int total = B * n_samples * HW;
     int blocks = (total + threads - 1) / threads;
 
-    gm1d_inverse_cdf_cuda_kernel<<<blocks, threads>>>(
+    if (!total) return;
+    const c10::cuda::CUDAGuard device_guard(means.device());
+    gm1d_inverse_cdf_cuda_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         means.data_ptr<float>(),
         logstds.data_ptr<float>(),
         logweights.data_ptr<float>(),
@@ -169,5 +174,5 @@ void gm1d_inverse_cdf(
         eps,
         max_step_size
     );
-    cudaDeviceSynchronize();
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

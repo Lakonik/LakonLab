@@ -7,6 +7,8 @@ from lakonlab.utils import rgetattr
 
 from mmcv.runner.optimizer.builder import OPTIMIZERS
 
+from .default_constructor import DefaultOptimizerConstructor  # noqa: F401
+
 
 def register_bitsandbytes_optimizers() -> List:
     bitsandbytes_optimizers = []

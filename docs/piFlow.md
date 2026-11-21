@@ -37,7 +37,7 @@ In ICLR 2026
 
   <img src="assets/piflow/piflow_dmd_texture_comparison.jpg" width="1000" alt=""/>
 
-- **Scalability**: pi-Flow scales from ImageNet DiT to 20-billion-parameter text-to-image models (Qwen-Image). This codebase is highly optimized for large-scale experiments. See the [Codebase](#codebase) section for details.
+- **Scalability**: pi-Flow scales from ImageNet DiT to 20-billion-parameter text-to-image models (Qwen-Image). This codebase is highly optimized for large-scale experiments. See the [Codebase](../README.md#codebase) section for details.
 
 ## Installation
 
@@ -162,7 +162,7 @@ Follow the instructions in the following links to reproduce the main results in 
 - [Distilling Qwen-Image](../configs/piqwen/README.md)
 - [Distilling FLUX](../configs/piflux/README.md)
 
-By default, checkpoints will be saved into [checkpoints/](../checkpoints/), logs will be saved into [work_dirs/](../work_dirs/), and sampled images will be saved into [viz/](../viz/). These directories can be changed by modifying the config file (AWS S3 URLs are supported).
+By default, checkpoints will be saved into `checkpoints/`, logs will be saved into `work_dirs/`, and sampled images will be saved into `viz/`. These directories can be changed by modifying the config file (AWS S3 URLs are supported).
 If existing checkpoints are found, training will automatically resume from the latest checkpoint. The training logs can be plotted using Tensorboard. Run the following command to start Tensorboard:
 ```bash
 tensorboard --logdir work_dirs/
@@ -178,7 +178,7 @@ dict(
 
 To export a model checkpoint to diffusers safetensors for inference, run the following command after training:
 ```bash
-python tools/export_piflow_to_diffusers.py <PATH_TO_CONFIG> --ckpt <PATH_TO_CKPT> --out-dir <OUTPUT_DIR>
+python tools/checkpoints/export_piflow_to_diffusers.py <PATH_TO_CONFIG> --ckpt <PATH_TO_CKPT> --out-dir <OUTPUT_DIR>
 ```
 
 ## Essential Code

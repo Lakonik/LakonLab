@@ -126,7 +126,7 @@ Download [ILSVRC2012_img_train.tar](https://www.image-net.org/challenges/LSVRC/2
 Run the following command to prepare the ImageNet dataset using DDP on 1 node with 8 GPUs
 
 ```bash
-torchrun --nnodes=1 --nproc_per_node=8 tools/cache_imagenet_data_sdvae.py
+torchrun --nnodes=1 --nproc_per_node=8 tools/datasets/cache_imagenet_data.py configs/gmflow/gmdit_k8_imagenet_8gpus.py --random-flip --launcher pytorch --diff_seed
 ```
 
 ### Training
@@ -145,7 +145,7 @@ python train.py configs/gmflow/gmdit_k8_imagenet_8gpus.py --gpu-ids 0 1 2 3 4 5 
 
 The config in [gmdit_k8_imagenet_8gpus.py](../configs/gmflow/gmdit_k8_imagenet_8gpus.py) specifies a training batch size of 512 images per GPU and an inference batch size of 125 images per GPU. Training requires 32GB of VRAM per GPU, and the validation step requires an additional 8GB of VRAM per GPU. If you are using 32GB GPUs, you can disable the validation step by adding the `--no-validate` flag to the training command. Alternatively, you can also edit the config file to adjust the batch sizes.
 
-By default, checkpoints will be saved into [checkpoints/](../checkpoints/), logs will be saved into [work_dirs/](../work_dirs/), and sampled images will be saved into [viz/](../viz/).
+By default, checkpoints will be saved into `checkpoints/`, logs will be saved into `work_dirs/`, and sampled images will be saved into `viz/`.
 
 #### Resuming Training
 
@@ -174,7 +174,7 @@ python test.py configs/gmflow/gmdit_k8_imagenet_test.py --ckpt checkpoints/gmdit
 
 The config in [gmdit_k8_imagenet_test.py](../configs/gmflow/gmdit_k8_imagenet_test.py) specifies an inference batch size of 125 images per GPU, which requires 35GB of VRAM per GPU. You can edit the config file to adjust the batch size.
 
-The evaluation results will be saved to where the checkpoint is located, and the sampled images will be saved into [viz/](viz/).
+The evaluation results will be saved to where the checkpoint is located, and the sampled images will be saved into `viz/`.
 
 ## Toy Model on 2D Checkerboard
 

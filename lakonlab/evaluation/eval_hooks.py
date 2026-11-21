@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Hansheng Chen
 
-import sys
 import os
+import tqdm
 import math
 import numpy as np
 import warnings
@@ -12,12 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import mmcv
 from mmcv.runner import HOOKS, Hook, get_dist_info
-from mmcv.fileio import FileClient
 from . import build_metric
 from lakonlab.models.architectures.utils import get_module_device
 from lakonlab.runner.timer import default_timers
+from lakonlab.runner.utils import preserve_rng_state
 from lakonlab.utils import gc_context
-from lakonlab.utils.io_utils import save_image, save_video, load_images_parallel
+from lakonlab.utils.io_utils import save_image, save_video, save_video_audio, load_images_parallel, FileClient
 from lakonlab.ui.media_viewer import write_html
 
 default_timers.add_timer('total time')
@@ -33,7 +33,8 @@ def flatten_list(lst):
 
 def evaluate(model, dataloader, metrics=None,
              feed_batch_size=32, viz_dir=None, viz_num=None, sample_kwargs=dict(),
-             fps=16, enable_timers=False, reuse_viz=False):
+             fps=16, enable_timers=False, reuse_viz=False, sample_rate=None):
+    assert dataloader.batch_size is not None, 'Evaluation requires a fixed-size dataloader.'
     has_metrics = metrics is not None and len(metrics) > 0
     if has_metrics:
         for metric in metrics:
@@ -54,14 +55,15 @@ def evaluate(model, dataloader, metrics=None,
         saved_data_ids = set()
         file_client = FileClient.infer_client(uri=viz_dir)
         executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 4)
+        save_futures = []
     else:
         html_entries = saved_data_ids = file_client = executor = None
 
     if rank == 0:
         mmcv.print_log(
             f'Generate {max_num_fakes} fake samples for evaluation', 'lakonlab')
-        pbar = mmcv.ProgressBar(max_num_fakes)
 
+    pbar = tqdm.tqdm(total=max_num_fakes, disable=rank != 0)
     log_vars = dict()
     batch_size_list = []
 
@@ -114,7 +116,7 @@ def evaluate(model, dataloader, metrics=None,
             sample_kwargs_ = deepcopy(sample_kwargs)
 
             with default_timers['total time']:
-                outputs_dict = model.val_step(data, show_pbar=rank == 0, **sample_kwargs_)
+                outputs_dict = model.val_step(data, **sample_kwargs_)
 
             if viz_dir is not None:
                 batch_names = list(flatten_list(data['name'].data))
@@ -123,21 +125,26 @@ def evaluate(model, dataloader, metrics=None,
                         continue
                     name = batch_names[batch_id]
 
-                    image_viz = (outputs_dict['pred_imgs'][batch_id] * 255).round().to(torch.uint8)
-                    if image_viz.dim() == 3:  # image
-                        image_viz = image_viz.permute(1, 2, 0).cpu().numpy()
+                    image_out = (outputs_dict['pred_imgs'][batch_id] * 255).round_().to(torch.uint8).cpu()
+                    if image_out.dim() == 3:  # image
+                        image_out = image_out.permute(1, 2, 0).numpy()
                         filename = f'{data_id:09d}.png'
-                        executor.submit(
-                            save_image,
-                            image_viz, file_client.join_path(viz_dir, filename), file_client)
-                    elif image_viz.dim() == 4:  # video
-                        image_viz = image_viz.permute(1, 2, 3, 0).cpu().numpy()  # (t, h, w, c)
+                        filepath = file_client.join_path(viz_dir, filename)
+                        future = executor.submit(save_image, image_out, filepath, file_client)
+                    elif image_out.dim() == 4:  # video
+                        image_out = image_out.permute(1, 2, 3, 0).numpy()  # (t, h, w, c)
                         filename = f'{data_id:09d}.mp4'
-                        executor.submit(
-                            save_video,
-                            image_viz, file_client.join_path(viz_dir, filename), file_client, fps)
+                        filepath = file_client.join_path(viz_dir, filename)
+                        if 'pred_audio' in outputs_dict:
+                            audio_out = outputs_dict['pred_audio'][batch_id].float().cpu().numpy()
+                            future = executor.submit(
+                                save_video_audio, image_out, audio_out, filepath, file_client, fps, sample_rate)
+                        else:
+                            future = executor.submit(
+                                save_video, image_out, filepath, file_client, fps)
                     else:
-                        raise ValueError(f'Unsupported image dimension: {image_viz.dim()}')
+                        raise ValueError(f'Unsupported image dimension: {image_out.dim()}')
+                    save_futures.append(future)
                     rel_filepath = file_client.join_path(os.path.basename(viz_dir), filename)
                     html_entries.append((data_id, rel_filepath, name))
                     saved_data_ids.add(data_id)
@@ -169,17 +176,19 @@ def evaluate(model, dataloader, metrics=None,
                 for batch_id, batch_imgs in enumerate(pred_imgs):
                     if getattr(metric, 'requires_prompt', False):
                         metric.feed(
-                            dict(imgs=batch_imgs * 2 - 1, prompts=prompts[batch_id]), 'fakes')
+                            dict(imgs=batch_imgs, prompts=prompts[batch_id]), 'fakes')
                         if real_imgs is not None:
                             metric.feed(
-                                dict(imgs=real_imgs[batch_id] * 2 - 1, prompts=prompts[batch_id]), 'reals')
+                                dict(imgs=real_imgs[batch_id], prompts=prompts[batch_id]), 'reals')
                     else:
-                        metric.feed(batch_imgs * 2 - 1, 'fakes')
+                        metric.feed(batch_imgs, 'fakes')
                         if real_imgs is not None:
-                            metric.feed(real_imgs[batch_id] * 2 - 1, 'reals')
+                            metric.feed(real_imgs[batch_id], 'reals')
 
-        if rank == 0:
-            pbar.update(total_batch_size)
+            # Split tensors and the loop variable retain views of the full output.
+            pred_imgs = real_imgs = batch_imgs = None
+        del outputs_dict
+        pbar.update(total_batch_size)
 
     if ws > 1:
         device = get_module_device(model)
@@ -212,6 +221,8 @@ def evaluate(model, dataloader, metrics=None,
             html_path = file_client.join_path(os.path.dirname(viz_dir), os.path.basename(viz_dir) + '.html')
             write_html(html_path, html_entries, file_client)
         executor.shutdown(wait=True)
+        for future in save_futures:
+            future.result()
 
     if enable_timers:
         default_timers.print_all()
@@ -244,11 +255,15 @@ class GenerativeEvalHook(Hook):
                  viz_num=None,
                  clear_reals=False,
                  prefix='',
-                 metric_cpu_offload=True):
+                 metric_cpu_offload=True,
+                 fps=16,
+                 sample_rate=None):
         if metrics is None:
             metrics = []
 
         self.dataloader = dataloader
+        self.fps = fps
+        self.sample_rate = sample_rate
         self.dist = dist
         self.sample_kwargs = sample_kwargs if sample_kwargs else dict()
         self.save_best_ckpt = save_best_ckpt
@@ -352,62 +367,63 @@ class GenerativeEvalHook(Hook):
 
     @torch.no_grad()
     def after_train_iter(self, runner):
-        with gc_context(enable=True):
-            interval = self.get_current_interval(runner)
-            if not self.every_n_iters(runner, interval):
-                return
+        interval = self.get_current_interval(runner)
+        if not self.every_n_iters(runner, interval):
+            return
+        # nothing the evaluation imports or runs may perturb the training RNG streams
+        with gc_context(enable=True), preserve_rng_state():
+            self._run_eval(runner)
 
-            torch.cuda.empty_cache()
+    def _run_eval(self, runner):
+        torch.cuda.empty_cache()
 
-            runner.model.eval()
-            rank, ws = get_dist_info()
+        runner.model.eval()
+        rank, ws = get_dist_info()
 
-            if self.viz_dir is not None:
-                viz_dir = self.file_client.join_path(self.viz_dir, str(runner.iter + 1))
-                if rank == 0:
-                    if self.file_client.exists(viz_dir):
-                        for name in self.file_client.list_dir_or_file(viz_dir):
-                            self.file_client.remove(self.file_client.join_path(viz_dir, name))
-                if ws > 1:
-                    torch.distributed.barrier()
-            else:
-                viz_dir = None
-            log_vars = evaluate(
-                runner.model, self.dataloader, self.metrics, self.feed_batch_size,
-                viz_dir, self.viz_num, self.sample_kwargs)
-
-            if len(runner.log_buffer.output) == 0:
-                runner.log_buffer.clear()
-
-            # a dirty walkround to change the line at the end of pbar
+        if self.viz_dir is not None:
+            viz_dir = self.file_client.join_path(self.viz_dir, str(runner.iter + 1))
             if rank == 0:
-                sys.stdout.write('\n')
-                for metric in self.metrics:
-                    metric.summary()
-                    for name, val in metric._result_dict.items():
-                        prefix_name = self.prefix + '_' + name if len(self.prefix) > 0 else name
-                        runner.log_buffer.output[self.data + '_' + prefix_name] = val
-                        # record best metric and save the best ckpt
-                        if self.save_best_ckpt and name in self.best_metric:
-                            self._save_best_ckpt(runner, val, name)
-                for name, val in log_vars.items():
+                if self.file_client.exists(viz_dir):
+                    for name in self.file_client.list_dir_or_file(viz_dir):
+                        self.file_client.remove(self.file_client.join_path(viz_dir, name))
+            if ws > 1:
+                torch.distributed.barrier()
+        else:
+            viz_dir = None
+        log_vars = evaluate(
+            runner.model, self.dataloader, self.metrics, self.feed_batch_size,
+            viz_dir, self.viz_num, self.sample_kwargs, fps=self.fps, sample_rate=self.sample_rate)
+
+        if len(runner.log_buffer.output) == 0:
+            runner.log_buffer.clear()
+
+        if rank == 0:
+            for metric in self.metrics:
+                metric.summary()
+                for name, val in metric._result_dict.items():
                     prefix_name = self.prefix + '_' + name if len(self.prefix) > 0 else name
-                    # print(self.data + '_' + prefix_name + ' = {}'.format(val))
                     runner.log_buffer.output[self.data + '_' + prefix_name] = val
                     # record best metric and save the best ckpt
                     if self.save_best_ckpt and name in self.best_metric:
                         self._save_best_ckpt(runner, val, name)
-                runner.log_buffer.ready = True
+            for name, val in log_vars.items():
+                prefix_name = self.prefix + '_' + name if len(self.prefix) > 0 else name
+                # print(self.data + '_' + prefix_name + ' = {}'.format(val))
+                runner.log_buffer.output[self.data + '_' + prefix_name] = val
+                # record best metric and save the best ckpt
+                if self.save_best_ckpt and name in self.best_metric:
+                    self._save_best_ckpt(runner, val, name)
+            runner.log_buffer.ready = True
 
-            runner.model.train()
+        runner.model.train()
 
-            for metric in self.metrics:
-                metric.clear(clear_reals=self.clear_reals)
-                if self.metric_cpu_offload:
-                    if hasattr(metric, 'offload_to_cpu'):
-                        metric.offload_to_cpu()
+        for metric in self.metrics:
+            metric.clear(clear_reals=self.clear_reals)
+            if self.metric_cpu_offload:
+                if hasattr(metric, 'offload_to_cpu'):
+                    metric.offload_to_cpu()
 
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
     def _save_best_ckpt(self, runner, new_score, metric_name):
         """Save checkpoint with best metric score.

@@ -1,4 +1,8 @@
+import contextlib
+import warnings
+
 import torch
+from torch.nn.parallel import DistributedDataParallel
 import mmcv
 
 from . import MMDistributedDataParallelFix, DistributedDataParallelWrapper, FSDPWrapper, FSDP2Wrapper
@@ -51,3 +55,34 @@ def apply_module_wrapper(model, module_wrapper, cfg):
     else:
         raise ValueError(f'Unsupported module wrapper: {module_wrapper}.')
     return model
+
+
+@contextlib.contextmanager
+def maybe_ddp_no_sync(modules, enabled=True):
+    if not enabled:
+        yield
+        return
+
+    seen = set()
+    with contextlib.ExitStack() as stack:
+        for module in modules:
+            if module is None:
+                continue
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            if isinstance(module, DistributedDataParallel):
+                if module.static_graph:
+                    # entering no_sync on a static-graph DDP module corrupts its
+                    # one-shot graph recording (crashes with an internal reducer
+                    # assert), so fall back to syncing gradients every step
+                    warnings.warn(
+                        'maybe_ddp_no_sync: skipping no_sync for a DDP module with '
+                        'static_graph=True (incompatible with no_sync). Gradients '
+                        'will be all-reduced every step; disable static_graph in '
+                        'ddp_kwargs to enable gradient-accumulation no_sync.',
+                        RuntimeWarning)
+                    continue
+                stack.enter_context(module.no_sync())
+        yield

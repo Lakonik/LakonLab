@@ -139,6 +139,7 @@ class DiffusionLoss(nn.Module):
                              timesteps,
                              total_timesteps,
                              prefix_name,
+                             shift=1.0,
                              reduction='mean'):
         """Collect loss logs by quartile timesteps.
 
@@ -155,8 +156,9 @@ class DiffusionLoss(nn.Module):
         Returns:
             dict: Collected log variables.
         """
-        quartile = (timesteps / total_timesteps * 4)
-        quartile = quartile.type(torch.LongTensor)
+        sigmas = timesteps / total_timesteps
+        raw_t = sigmas / (shift + (1 - shift) * sigmas)
+        quartile = (raw_t * 4).type(torch.LongTensor)
 
         log_vars = dict()
 

@@ -7,7 +7,8 @@
     overflow: visible;
 }
 
-.svelte-1vd8eap {
+/* Gradio's automatic wrapper around consecutive form inputs (sliders, numbers, dropdowns) */
+.gradio-container div.form {
     display: flex;
     flex-direction: inherit;
     flex-wrap: wrap;
@@ -48,26 +49,46 @@
   overflow: hidden;                       /* avoid odd overflow on iOS */
 }
 
-/* Image scales by BOTH constraints: height cap and row width */
-.vh-img-700 .image-container img {
+/* Images and videos scale by BOTH constraints: height cap and row width */
+.vh-img-700 .image-container img,
+.vh-img-700 video {
   max-block-size: 700px !important;      /* fixed max height cap */
-  max-inline-size: 100%;                  /* never wider than container */
-  inline-size: auto;                      /* keep aspect ratio */
-  block-size: auto;
-  object-fit: contain;
-  display: block;
 }
 
-.vh-img-1000 .image-container img {
-  max-block-size: 1000px !important;      /* fixed max height cap */
+.vh-img-1000 .image-container img,
+.vh-img-1000 video {
+  max-block-size: 1000px !important;     /* fixed max height cap */
+}
+
+.vh-img .image-container img,
+.vh-img video {
   max-inline-size: 100%;                  /* never wider than container */
-  inline-size: auto;                      /* keep aspect ratio */
-  block-size: auto;
+  inline-size: auto !important;           /* keep aspect ratio */
+  block-size: auto !important;
   object-fit: contain;
   display: block;
+  margin-inline: auto;
 }
 
 .gradio-container .seed-input input {   /* remove the border and use box-shadow instead for height alignment */
     border: none !important;
     box-shadow: inset 0 0 0 var(--input-border-width) var(--input-border-color) !important;
+}
+
+.compact-dropdown .wrap-inner {   /* tight padding so the dropdown is no taller than a slider */
+    padding: 0 4px !important;
+}
+
+.compact-dropdown .icon-wrap {   /* the arrow is absolutely positioned; match the text's 9px side inset */
+    right: 2px !important;
+}
+
+.compact-dropdown input {
+    margin-top: 2px !important;
+    margin-bottom: 2px !important;
+}
+
+.gradio-container .table-wrap > table {   /* Gradio 6 pads and offsets the examples table inside its frame */
+    padding: 0;
+    margin-top: 0;
 }

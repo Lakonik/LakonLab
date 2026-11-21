@@ -1,16 +1,16 @@
 # Copyright (c) 2026 Hansheng Chen
 
 import os
-import sys
 import json
 import shutil
 import logging
 import pickle
 import warnings
 import hashlib
+import math
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from contextlib import contextmanager, redirect_stdout, nullcontext
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -26,7 +26,7 @@ from datasets import DatasetDict, load_dataset
 from mmcv.runner import get_dist_info, load_checkpoint
 from open_clip import get_tokenizer, create_model
 from lakonlab.utils import get_root_logger
-from lakonlab.utils.io_utils import download_from_huggingface, download_from_url
+from lakonlab.utils.io_utils import download_from_huggingface, download_from_url, save_video, FileClient
 from .builder import METRICS
 from .precision_recall import compute_pr_score, compute_pr_score_distributed
 
@@ -36,23 +36,6 @@ TERO_INCEPTION_URL = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pre
 _inception_cache = {}
 _hpsv2_cache = {}
 _clip_cache = {}
-
-
-def _argv_ctx(argv):
-    class _Argv:
-
-        def __enter__(self):
-            self._old = sys.argv
-            sys.argv = argv
-
-        def __exit__(self, exc_type, exc, tb):
-            sys.argv = self._old
-
-    return _Argv()
-
-
-def _redirect_stdout(to_buf):
-    return redirect_stdout(to_buf) if to_buf is not None else nullcontext()
 
 
 @contextmanager
@@ -203,7 +186,7 @@ class Metric(ABC):
     object batch by batch, and we calculate intermediate results of these
     batches. Finally, We use these intermediate results to summarize the final
     result. And the result as a string can be obtained by property
-    'result_str'.
+    'result_str'. Image and video inputs use floating-point pixels in [0, 1].
 
     Args:
         num_images (int): The number of real/fake images needed to calculate
@@ -303,6 +286,52 @@ class Metric(ABC):
     @abstractmethod
     def summary(self):
         """please implement in subclass."""
+
+
+class VideoAdapterMixin:
+
+    def setup_video_adapter(self, video_fps=16.0, sample_fps=1.0):
+        if video_fps <= 0 or sample_fps <= 0:
+            raise ValueError('`video_fps` and `sample_fps` must be positive.')
+        self.video_fps = video_fps
+        self.sample_fps = sample_fps
+
+    def _flatten_video_frames(self, imgs, prompts=None):
+        if imgs.ndim == 4:
+            return imgs, prompts, None
+
+        batch_size, channels, num_frames, height, width = imgs.shape
+        sampled_frames = max(
+            1,
+            min(num_frames, math.floor(num_frames * self.sample_fps / self.video_fps))
+        )
+        indices = torch.linspace(
+            0,
+            num_frames - 1,
+            sampled_frames,
+            device=imgs.device,
+        ).round().long()
+        imgs = imgs.index_select(2, indices)
+        imgs = imgs.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * sampled_frames, channels, height, width
+        )
+
+        if prompts is not None:
+            assert len(prompts) == batch_size
+            prompts = [
+                prompt
+                for prompt in prompts
+                for _ in range(sampled_frames)
+            ]
+
+        return imgs, prompts, (batch_size, sampled_frames)
+
+    @staticmethod
+    def _reduce_video_frame_scores(scores, video_shape):
+        if video_shape is None:
+            return scores
+        batch_size, sampled_frames = video_shape
+        return scores.reshape(batch_size, sampled_frames, *scores.shape[1:]).mean(dim=1)
 
 
 @METRICS.register_module()
@@ -513,7 +542,7 @@ class InceptionMetrics(Metric):
             w_offset = (w - crop_size) // 2
             batch = batch[:, :, h_offset:h_offset + crop_size, w_offset:w_offset + crop_size]
         assert self.inception_style == 'StyleGAN'
-        batch = (batch * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        batch = (batch * 255 + 0.5).clamp(0, 255).to(torch.uint8)
         feat = self.inception_net(batch, return_features=True)
         pred = F.linear(feat, self.inception_net.output.weight).softmax(dim=1)
         return feat, pred
@@ -726,42 +755,46 @@ class ColorStats(Metric):
     def srgb_to_linear(c):
         threshold = 0.04045
         below = c <= threshold
-        out = torch.where(
-            below, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-        return out
+        nonlinear = (c + 0.055).div_(1.055).pow_(2.4)
+        torch.where(below, c / 12.92, nonlinear, out=nonlinear)
+        return nonlinear
 
     @staticmethod
     def linear_to_srgb(c):
         threshold = 0.0031308
         below = c <= threshold
-        out = torch.where(
-            below, 12.92 * c, 1.055 * c ** (1.0 / 2.4) - 0.055)
-        return out
+        nonlinear = c.pow(1.0 / 2.4).mul_(1.055).sub_(0.055)
+        torch.where(below, 12.92 * c, nonlinear, out=nonlinear)
+        return nonlinear
 
     def rgb_to_grayscale_srgb(self, img_srgb):
         img_lin = self.srgb_to_linear(img_srgb)
         R_lin, G_lin, B_lin = img_lin.unbind(dim=1)
-        Y_lin = 0.2126 * R_lin + 0.7152 * G_lin + 0.0722 * B_lin
+        Y_lin = 0.2126 * R_lin
+        Y_lin.add_(0.7152 * G_lin).add_(0.0722 * B_lin)
+        del img_lin, R_lin, G_lin, B_lin
         gray_srgb = self.linear_to_srgb(Y_lin)
         return gray_srgb
 
     @staticmethod
     def srgb_to_hsv_saturation(img_srgb):
         c_max = torch.amax(img_srgb, dim=1)
-        c_min = torch.amin(img_srgb, dim=1)
-        delta = c_max - c_min
-        sat = delta / c_max.clamp(min=1e-5)
+        delta = c_max - torch.amin(img_srgb, dim=1)
+        sat = delta.div_(c_max.clamp(min=1e-5))
         return sat
 
     def compute_stats(self, batch):
-        batch = (batch / 2 + 0.5).clamp(0, 1)
+        batch = batch.clamp(0, 1)
         gray = self.rgb_to_grayscale_srgb(batch).flatten(1)
         contrast, brightness = torch.std_mean(gray, dim=1)
+        del gray
         saturation = self.srgb_to_hsv_saturation(batch).flatten(1).mean(dim=1)
         return torch.stack([brightness, contrast, saturation], dim=-1)
 
     @torch.no_grad()
     def feed_op(self, batch, mode):
+        if torch.cuda.is_available():
+            batch = batch.cuda()
         stats = self.compute_stats(batch)
 
         if dist.is_initialized():
@@ -770,7 +803,6 @@ class ColorStats(Metric):
             dist.all_gather(placeholder, stats)
             stats = torch.stack(placeholder, dim=1).reshape(stats.size(0) * ws, *stats.shape[1:])
 
-        # in distributed training, we only collect features at rank-0.
         if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
             self.stats.append(stats.cpu())
 
@@ -824,14 +856,17 @@ class ColorStats(Metric):
 
 
 @METRICS.register_module()
-class HPSv2(Metric):
+class HPSv2(VideoAdapterMixin, Metric):
     name = 'HPSv2'
     requires_prompt = True
 
     def __init__(self,
                  num_images=None,
-                 hps_version='v2.1'):
+                 hps_version='v2.1',
+                 video_fps=16.0,
+                 sample_fps=1.0):
         super().__init__(num_images)
+        self.setup_video_adapter(video_fps, sample_fps)
         self.hps_version = hps_version
         self.device = 'cpu'  # Initialize on CPU
         self.dtype = torch.float16
@@ -862,18 +897,21 @@ class HPSv2(Metric):
                 imgs, (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2), mode='constant', value=0)
         return imgs
 
-    @torch.no_grad()
-    def feed_op(self, batch, mode):
-        imgs = batch['imgs']
-        prompts = batch['prompts']
-
-        imgs = (imgs.to(device=self.device, dtype=torch.float32) / 2 + 0.5).clamp(0, 1)
+    def _score_images(self, imgs, prompts):
+        imgs = imgs.to(device=self.device, dtype=torch.float32).clamp(0, 1)
         imgs = ((self.resize(imgs) - self.image_mean) / self.image_std).to(dtype=self.dtype)
         prompts = self.tokenizer(prompts).to(device=self.device)
 
         outputs = self.model(imgs, prompts)
         image_features, text_features = outputs['image_features'], outputs['text_features']
-        hps_scores = (image_features * text_features).sum(dim=-1)  # (bs, )
+        return (image_features * text_features).sum(dim=-1)  # (bs, )
+
+    @torch.no_grad()
+    def feed_op(self, batch, mode):
+        imgs, prompts, video_shape = self._flatten_video_frames(
+            batch['imgs'], batch['prompts'])
+        hps_scores = self._score_images(imgs, prompts)
+        hps_scores = self._reduce_video_frame_scores(hps_scores, video_shape)
 
         if dist.is_initialized():
             ws = dist.get_world_size()
@@ -945,14 +983,14 @@ class HPSv2(Metric):
 
 
 @METRICS.register_module()
-class CLIPSimilarity(Metric):
+class CLIPSimilarity(VideoAdapterMixin, Metric):
     """
     Average image–text CLIP cosine similarity (↑ better).
     Preprocess emulates OpenAI CLIP for ViT-L/14@336:
       - Resize so min(H, W) = 336 (bicubic, antialias), keep aspect ratio
       - Center crop to 336x336
       - Normalize with model.visual.image_mean/std
-    Expects batch = {'imgs': (B,3,H,W) in [-1,1], 'prompts': List[str]}
+    Expects batch = {'imgs': (B,3,H,W) or (B,3,T,H,W) in [0,1], 'prompts': List[str]}
     """
     name = 'CLIPSimilarity'
     requires_prompt = True
@@ -963,8 +1001,11 @@ class CLIPSimilarity(Metric):
         model_name='ViT-L-14-336-quickgelu',
         pretrained='openai',
         precision='fp16',   # 'fp16' | 'fp32' | 'bf16'
+        video_fps=16.0,
+        sample_fps=1.0,
     ):
         super().__init__(num_images)
+        self.setup_video_adapter(video_fps, sample_fps)
         self.model_name = model_name
         self.pretrained = pretrained
         self.precision = precision
@@ -1031,16 +1072,8 @@ class CLIPSimilarity(Metric):
         imgs = (imgs - self.image_mean) / self.image_std
         return imgs.to(dtype=self.dtype)
 
-    @torch.no_grad()
-    def feed_op(self, batch, mode):
-        if mode == 'reals':
-            return 0
-
-        imgs = batch['imgs']
-        prompts = batch['prompts']
-
-        # [-1,1] -> [0,1]
-        imgs = (imgs.to(device=self.device, dtype=torch.float32) / 2 + 0.5).clamp(0, 1)
+    def _score_images(self, imgs, prompts):
+        imgs = imgs.to(device=self.device, dtype=torch.float32).clamp(0, 1)
         imgs = self._resize_min_side_then_center_crop(imgs)
 
         # Tokenize on device
@@ -1058,9 +1091,15 @@ class CLIPSimilarity(Metric):
         # Cosine similarity per pair
         img_feat = F.normalize(img_feat, dim=-1)
         txt_feat = F.normalize(txt_feat, dim=-1)
-        sim = (img_feat * txt_feat).sum(dim=-1).to(torch.float32)  # (B,)
+        return (img_feat * txt_feat).sum(dim=-1).to(torch.float32)  # (B,)
 
-        # DDP gather
+    @torch.no_grad()
+    def feed_op(self, batch, mode):
+        imgs, prompts, video_shape = self._flatten_video_frames(
+            batch['imgs'], batch['prompts'])
+        sim = self._score_images(imgs, prompts)
+        sim = self._reduce_video_frame_scores(sim, video_shape)
+
         if dist.is_initialized():
             ws = dist.get_world_size()
             bucket = [torch.empty_like(sim) for _ in range(ws)]
@@ -1141,7 +1180,8 @@ class BenchmarkImageExport(Metric):
                  num_images=None,
                  prompt_items=None,
                  prompt_key='prompt',
-                 export_size=1024):
+                 export_size=1024,
+                 check_prompt=True):
         if prompt_items is None:
             assert os.path.exists(prompt_path), f'prompt_path {prompt_path} does not exist.'
             prompt_items = []
@@ -1157,6 +1197,7 @@ class BenchmarkImageExport(Metric):
         self.prompt_items = prompt_items
         self.prompt_key = prompt_key
         self.export_size = export_size
+        self.check_prompt = check_prompt
         assert self.prompt_items, f'No prompts found in {prompt_path}.'
         self.prompt_list = [item[self.prompt_key] for item in self.prompt_items]
         self.img_buffer = []
@@ -1187,16 +1228,18 @@ class BenchmarkImageExport(Metric):
         imgs = batch['imgs']
         if torch.cuda.is_available():
             imgs = imgs.cuda()
-        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        imgs = imgs.clamp(0, 1)
         if (self.export_size is not None
                 and imgs.shape[-2:] != (self.export_size, self.export_size)):
+            image_shape = imgs.shape
             imgs = F.interpolate(
-                imgs,
+                imgs.reshape(-1, *image_shape[-3:]),
                 size=(self.export_size, self.export_size),
                 mode='bicubic',
                 align_corners=False,
                 antialias=True).clamp(0, 1)
-        imgs = (imgs.permute(0, 2, 3, 1) * 255).round().to(dtype=torch.uint8).contiguous()
+            imgs = imgs.reshape(*image_shape[:-2], self.export_size, self.export_size)
+        imgs = (imgs.movedim(1, -1) * 255).round().to(dtype=torch.uint8).contiguous()
         prompts = batch['prompts']
 
         if dist.is_available() and dist.is_initialized():
@@ -1214,11 +1257,12 @@ class BenchmarkImageExport(Metric):
         for img, prompt in zip(imgs, prompts):
             self.img_buffer.append((img, prompt))
             if len(self.img_buffer) == self.samples_per_prompt:
-                expected_prompt = self.prompt_list[self.current_idx]
-                for _, p in self.img_buffer:
-                    assert p == expected_prompt, (
-                        f'Unexpected prompt order at index {self.current_idx}: '
-                        f'{p!r} != {expected_prompt!r}')
+                if self.check_prompt:
+                    expected_prompt = self.prompt_list[self.current_idx]
+                    for _, p in self.img_buffer:
+                        assert p == expected_prompt, (
+                            f'Unexpected prompt order at index {self.current_idx}: '
+                            f'{p!r} != {expected_prompt!r}')
 
                 if self.executor is not None:
                     imgs_to_save = np.stack([x[0] for x in self.img_buffer], axis=0)
@@ -1350,6 +1394,30 @@ class GenEvalExport(BenchmarkImageExport):
 
 
 @METRICS.register_module()
+class LongTextExport(BenchmarkImageExport):
+    """Export for LongText-Bench (X-Omni): a flat folder of ``{prompt_id}_{sample}.png``, which
+    its ``evaluate_text_reward.py`` reads directly (it parses the prompt id before the underscore)."""
+    name = 'LongTextExport'
+
+    def __init__(self,
+                 prompt_path='data/longtext-prompts/prompts.jsonl',
+                 img_root_dir='work_dirs/benchmark_exports/longtext',
+                 samples_per_prompt=4,
+                 clear_existing=True,
+                 export_size=1024):
+        super().__init__(
+            prompt_path=prompt_path,
+            img_root_dir=img_root_dir,
+            samples_per_prompt=samples_per_prompt,
+            clear_existing=clear_existing,
+            export_size=export_size)
+
+    def _save_prompt_images(self, imgs, prompt_item, prompt_idx):
+        for sample_idx, img in enumerate(imgs):
+            Image.fromarray(img).save(os.path.join(self.img_root_dir, f'{prompt_item["id"]}_{sample_idx}.png'))
+
+
+@METRICS.register_module()
 class HPSv3BenchmarkExport(BenchmarkImageExport):
     name = 'HPSv3BenchmarkExport'
 
@@ -1386,3 +1454,37 @@ class HPSv3BenchmarkExport(BenchmarkImageExport):
         prompt = prompt_item[self.prompt_key]
         with open(os.path.join(category_dir, f'{image_stem}.txt'), 'w', encoding='utf-8') as f:
             f.write(prompt)
+
+
+@METRICS.register_module()
+class VBenchExport(BenchmarkImageExport):
+    name = 'VBenchExport'
+
+    def __init__(self,
+                 prompt_path='data/vbench-prompts/prompts.jsonl',
+                 img_root_dir='work_dirs/benchmark_exports/vbench',
+                 samples_per_prompt=5,
+                 clear_existing=True,
+                 fps=16,
+                 quality=8,
+                 bitrate=None,
+                 check_prompt=True):
+        assert samples_per_prompt == 5, 'VBenchExport expects 5 videos per prompt.'
+        self.fps = fps
+        self.quality = quality
+        self.bitrate = bitrate
+        self.file_client = FileClient.infer_client(uri=img_root_dir)
+        super().__init__(
+            prompt_path=prompt_path,
+            img_root_dir=img_root_dir,
+            samples_per_prompt=samples_per_prompt,
+            clear_existing=clear_existing,
+            export_size=None,
+            check_prompt=check_prompt)
+
+    def _save_prompt_images(self, imgs, prompt_item, prompt_idx):
+        prompt = prompt_item[self.prompt_key]
+        for sample_idx, img in enumerate(imgs):
+            save_video(
+                img, os.path.join(self.img_root_dir, f'{prompt}-{sample_idx}.mp4'),
+                self.file_client, fps=self.fps, quality=self.quality, bitrate=self.bitrate)

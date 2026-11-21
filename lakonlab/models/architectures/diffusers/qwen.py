@@ -1,18 +1,116 @@
+from math import prod
+from typing import Any
+
+import numpy as np
 import torch
 
 from accelerate import init_empty_weights
 from diffusers.models import QwenImageTransformer2DModel as _QwenImageTransformer2DModel
+from diffusers.models.transformers.transformer_qwenimage import compute_text_seq_len_from_mask
 from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_qwen_lora_to_diffusers
+from diffusers.utils import apply_lora_scale
 from peft import LoraConfig
 
 from ...builder import MODULES
-from ..utils import flex_freeze
+from ..utils import flex_freeze, fp32_module_forward
 from lakonlab.utils import get_root_logger
 from lakonlab.runner.checkpoint import load_checkpoint, _load_cached_checkpoint
 
 
+class _QwenImageTransformer2DModelFix(_QwenImageTransformer2DModel):
+
+    @apply_lora_scale("attention_kwargs")
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.Tensor = None,
+        img_shapes: list[list[tuple[int, int, int]]] | None = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        controlnet_block_samples=None,
+        additional_t_cond=None,
+        fp32_final_layer: bool = False
+    ) -> torch.Tensor:
+
+        hidden_states = self.img_in(hidden_states)
+
+        timestep = timestep.to(hidden_states.dtype)
+
+        if self.zero_cond_t:
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+            modulate_index = torch.tensor(
+                [[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in img_shapes],
+                device=timestep.device,
+                dtype=torch.int,
+            )
+        else:
+            modulate_index = None
+
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+        text_seq_len, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
+            encoder_hidden_states, encoder_hidden_states_mask)
+
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states, additional_t_cond)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
+        )
+
+        image_rotary_emb = self.pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device)
+
+        block_attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
+        if encoder_hidden_states_mask is not None:
+            batch_size, image_seq_len = hidden_states.shape[:2]
+            image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
+            joint_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            block_attention_kwargs['attention_mask'] = joint_attention_mask
+
+        for index_block, block in enumerate(self.transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    None,
+                    temb,
+                    image_rotary_emb,
+                    block_attention_kwargs,
+                    modulate_index,
+                )
+            else:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=None,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    joint_attention_kwargs=block_attention_kwargs,
+                    modulate_index=modulate_index,
+                )
+
+            if controlnet_block_samples is not None:
+                interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
+                interval_control = int(np.ceil(interval_control))
+                hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
+
+        if self.zero_cond_t:
+            temb = temb.chunk(2, dim=0)[0]
+
+        hidden_states = fp32_module_forward(
+            self.norm_out, hidden_states, temb, enabled=fp32_final_layer)
+        output = fp32_module_forward(self.proj_out, hidden_states, enabled=fp32_final_layer)
+
+        return output
+
+
 @MODULES.register_module()
-class QwenImageTransformer2DModel(_QwenImageTransformer2DModel):
+class QwenImageTransformer2DModel(_QwenImageTransformer2DModelFix):
 
     def __init__(
             self,
@@ -83,7 +181,7 @@ class QwenImageTransformer2DModel(_QwenImageTransformer2DModel):
                         pretrained_lora_single, map_location='cpu', logger=logger)
                     lora_state_dict = _convert_non_diffusers_qwen_lora_to_diffusers(lora_state_dict)
                     self.load_lora_adapter(lora_state_dict)
-                    self.fuse_lora(lora_scale=pretrained_lora_scale_single)
+                    self.fuse_lora(lora_scale=pretrained_lora_scale_single, safe_fusing=True)
                     self.unload_lora()
                     self.requires_grad_(True)  # PEFT freezes the weights after fusing
 
@@ -132,8 +230,7 @@ class QwenImageTransformer2DModel(_QwenImageTransformer2DModel):
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             timestep=timestep,
             img_shapes=img_shapes,
-            return_dict=False,
-            **kwargs)[0]
+            **kwargs)
 
         output = output.permute(0, 2, 1).reshape(bs, self.out_channels, h, w)
         return self.unpatchify(output)

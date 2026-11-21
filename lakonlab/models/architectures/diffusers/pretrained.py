@@ -6,15 +6,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusers.models import (
-    AutoencoderKL, AutoencoderKLQwenImage, AutoencoderKLFlux2, AutoencoderRAE
+    AutoencoderKL, AutoencoderKLWan, AutoencoderKLQwenImage, AutoencoderKLFlux2, AutoencoderRAE,
+    AutoencoderKLMiniMaxH3 as _AutoencoderKLMiniMaxH3,
+    AutoencoderKLMiniMaxH3Audio as _AutoencoderKLMiniMaxH3Audio
 )
 from diffusers.pipelines import (
-    FluxPipeline, QwenImagePipeline, StableDiffusion3Pipeline, Flux2Pipeline,
-    ZImagePipeline, Flux2KleinPipeline
+    FluxPipeline, QwenImagePipeline, StableDiffusion3Pipeline, WanPipeline, Flux2Pipeline,
+    ZImagePipeline, Flux2KleinPipeline, Krea2Pipeline
 )
+from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3TextEncoderStep
+from transformers.utils.output_capturing import maybe_install_capturing_hooks
 
 from ...builder import MODULES
-from lakonlab.utils.io_utils import hf_model_loader
+from lakonlab.utils import is_warmup, onload
+from lakonlab.utils.io_utils import hf_model_loader, hf_modular_model_loader
 
 # Suppress truncation warnings from transformers and diffusers
 for name in (
@@ -66,9 +71,6 @@ class PretrainedVAE(nn.Module):
     def train(self, mode=True):
         mode = mode and (not self.eval_mode)
         return super().train(mode)
-
-    def forward(self, *args, **kwargs):
-        return self.vae(*args, return_dict=False, **kwargs)[0]
 
     def _encode(self, img):
         bs = img.size(0)
@@ -152,7 +154,7 @@ class PretrainedVAEEncoder(PretrainedVAE):
 
 
 @MODULES.register_module()
-class PretrainedVAEQwenImage(nn.Module):
+class PretrainedVAEWan(nn.Module):
     def __init__(self,
                  model_name_or_path=None,
                  use_slicing=False,
@@ -163,7 +165,7 @@ class PretrainedVAEQwenImage(nn.Module):
         super().__init__()
         if torch_dtype is not None:
             kwargs.update(torch_dtype=getattr(torch, torch_dtype))
-        self.vae = hf_model_loader(AutoencoderKLQwenImage, model_name_or_path, **kwargs)
+        self.vae = hf_model_loader(AutoencoderKLWan, model_name_or_path, **kwargs)
         if use_slicing:
             self.vae.enable_slicing()
         self.freeze = freeze
@@ -177,10 +179,218 @@ class PretrainedVAEQwenImage(nn.Module):
         mode = mode and (not self.eval_mode)
         return super().train(mode)
 
-    def forward(self, *args, **kwargs):
-        return self.vae(*args, return_dict=False, **kwargs)[0]
+    def encode(self, img):
+        device = img.device
+        dtype = img.dtype
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(
+            1, self.vae.config.z_dim, 1, 1, 1)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=device, dtype=dtype).view(
+            1, self.vae.config.z_dim, 1, 1, 1)
+        return (self.vae.encode(img).latent_dist.sample() - latents_mean) / latents_std
 
+    def decode(self, code):
+        device = code.device
+        dtype = code.dtype
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(
+            1, self.vae.config.z_dim, 1, 1, 1)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=device, dtype=dtype).view(
+            1, self.vae.config.z_dim, 1, 1, 1)
+        return self.vae.decode(code * latents_std + latents_mean, return_dict=False)[0]
+
+
+class AutoencoderKLMiniMaxH3(_AutoencoderKLMiniMaxH3):
+
+    _keep_in_fp32_modules = None
+    decode_tile_batch_size = 1
+
+    def _decode_clip(self, z):
+        if self.use_tiling and self.decode_tile_batch_size > 1:
+            ratio = self.spatial_compression_ratio
+            y_indices, y_lengths, y_overlaps = self._split_tiles(
+                z.size(-2) * ratio, self.tile_sample_min_height, self.tile_sample_min_overlap_height)
+            x_indices, x_lengths, x_overlaps = self._split_tiles(
+                z.size(-1) * ratio, self.tile_sample_min_width, self.tile_sample_min_overlap_width)
+            # Native tiling uses equal-sized tiles, including when either axis fits in one tile.
+            tiles = [
+                z[..., y // ratio:(y + h) // ratio, x // ratio:(x + w) // ratio]
+                for y, h in zip(y_indices, y_lengths) for x, w in zip(x_indices, x_lengths)]
+            decoded_tiles = []
+            for i in range(0, len(tiles), self.decode_tile_batch_size):
+                tile_batch = torch.cat(tiles[i:i + self.decode_tile_batch_size], dim=0)
+                decoded_tiles.extend(self.decoder(self.post_quant_conv(tile_batch)).split(z.size(0), dim=0))
+            rows = [decoded_tiles[i:i + len(x_indices)] for i in range(0, len(tiles), len(x_indices))]
+            output = self._stitch_tiles(rows, y_overlaps, x_overlaps)
+        else:
+            output = super()._decode_clip(z)
+        return output
+
+
+@MODULES.register_module()
+class PretrainedVAEMiniMaxH3(nn.Module):
+    def __init__(self,
+                 model_name_or_path=None,
+                 use_slicing=False,
+                 decode_tile_batch_size=1,
+                 freeze=True,
+                 eval_mode=True,
+                 torch_dtype='float32',
+                 **kwargs):
+        super().__init__()
+        if torch_dtype is not None:
+            kwargs.update(torch_dtype=getattr(torch, torch_dtype))
+        self.vae = hf_model_loader(AutoencoderKLMiniMaxH3, model_name_or_path, **kwargs)
+        self.vae.decode_tile_batch_size = decode_tile_batch_size
+        if use_slicing:
+            self.vae.enable_slicing()
+        self.freeze = freeze
+        self.eval_mode = eval_mode
+        if self.freeze:
+            self.requires_grad_(False)
+        if self.eval_mode:
+            self.eval()
+
+    def train(self, mode=True):
+        mode = mode and (not self.eval_mode)
+        return super().train(mode)
+
+    @onload
     def encode(self, img, sample_mode='sample'):
+        pixel_mean = torch.tensor((-0.030, -0.088, -0.188), device=img.device, dtype=img.dtype).view(1, 3, 1, 1, 1)
+        pixel_std = torch.tensor((0.458, 0.448, 0.450), device=img.device, dtype=img.dtype).view(1, 3, 1, 1, 1)
+        img = (img - pixel_mean) / pixel_std
+        latent_dist = self.vae.encode(img).latent_dist
+        if sample_mode == 'sample':
+            latents = latent_dist.sample()
+        elif sample_mode == 'argmax':
+            latents = latent_dist.mode()
+        else:
+            raise ValueError(f'Invalid sample_mode: {sample_mode}')
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=img.device, dtype=img.dtype).view(1, -1, 1, 1, 1)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=img.device, dtype=img.dtype).view(1, -1, 1, 1, 1)
+        return (latents - latents_mean) / latents_std
+
+    @onload
+    def decode(self, code):
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=code.device, dtype=code.dtype).view(1, -1, 1, 1, 1)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=code.device, dtype=code.dtype).view(1, -1, 1, 1, 1)
+        latents = code * latents_std + latents_mean
+        img = self.vae.decode(latents, return_dict=False)[0]
+        pixel_mean = torch.tensor((-0.030, -0.088, -0.188), device=code.device, dtype=code.dtype).view(1, 3, 1, 1, 1)
+        pixel_std = torch.tensor((0.458, 0.448, 0.450), device=code.device, dtype=code.dtype).view(1, 3, 1, 1, 1)
+        return img * pixel_std + pixel_mean
+
+
+class AutoencoderKLMiniMaxH3Audio(_AutoencoderKLMiniMaxH3Audio):
+
+    _keep_in_fp32_modules = None
+
+
+@MODULES.register_module()
+class PretrainedVAEMiniMaxH3Audio(nn.Module):
+    def __init__(self,
+                 model_name_or_path=None,
+                 freeze=True,
+                 eval_mode=True,
+                 torch_dtype='float32',
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='default',
+                     fullgraph=True,
+                     dynamic=False),
+                 **kwargs):
+        super().__init__()
+        if torch_dtype is not None:
+            kwargs.update(torch_dtype=getattr(torch, torch_dtype))
+        self.vae = hf_model_loader(AutoencoderKLMiniMaxH3Audio, model_name_or_path, **kwargs)
+        self.freeze = freeze
+        self.eval_mode = eval_mode
+        if self.freeze:
+            self.requires_grad_(False)
+        if self.eval_mode:
+            self.eval()
+        self._compiled_encode = None
+        self._compiled_decode = None
+        if compile_forward:
+            self._compiled_encode = torch.compile(self._encode, **compile_kwargs)
+            self._compiled_decode = torch.compile(self._decode, **compile_kwargs)
+
+    def train(self, mode=True):
+        mode = mode and (not self.eval_mode)
+        return super().train(mode)
+
+    def _encode(self, audio, sample_mode='sample'):
+        bs, channels, samples = audio.shape
+        latent_dist = self.vae.encode(audio.reshape(bs * channels, 1, samples)).latent_dist
+        if sample_mode == 'sample':
+            latents = latent_dist.sample()
+        elif sample_mode == 'argmax':
+            latents = latent_dist.mode()
+        else:
+            raise ValueError(f'Invalid sample_mode: {sample_mode}')
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=audio.device, dtype=audio.dtype).view(1, -1, 1)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=audio.device, dtype=audio.dtype).view(1, -1, 1)
+        latents = (latents - latents_mean) / latents_std
+        latents = latents[..., :round(samples / self.vae.hop_length)]
+        return latents.reshape(bs, channels, *latents.shape[1:]).permute(0, 2, 1, 3)
+
+    def _decode(self, code):
+        bs, latent_channels, channels, frames = code.shape
+        latents = code.permute(0, 2, 1, 3).reshape(bs * channels, latent_channels, frames)
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=code.device, dtype=code.dtype).view(1, -1, 1)
+        latents_std = torch.tensor(self.vae.config.latents_std, device=code.device, dtype=code.dtype).view(1, -1, 1)
+        audio = self.vae.decode(latents * latents_std + latents_mean, return_dict=False)[0]
+        return audio.reshape(bs, channels, -1)
+
+    @onload
+    def encode(self, audio, sample_mode='sample'):
+        if self._compiled_encode is not None:
+            return self._compiled_encode(audio, sample_mode=sample_mode)
+        return self._encode(audio, sample_mode=sample_mode)
+
+    @onload
+    def decode(self, code):
+        if self._compiled_decode is not None:
+            return self._compiled_decode(code)
+        return self._decode(code)
+
+
+@MODULES.register_module()
+class PretrainedVAEQwenImage(nn.Module):
+    def __init__(self,
+                 model_name_or_path=None,
+                 use_slicing=False,
+                 freeze=True,
+                 eval_mode=True,
+                 torch_dtype='float32',
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='default',
+                     fullgraph=True,
+                     dynamic=False),
+                 **kwargs):
+        super().__init__()
+        if torch_dtype is not None:
+            kwargs.update(torch_dtype=getattr(torch, torch_dtype))
+        self.vae = hf_model_loader(AutoencoderKLQwenImage, model_name_or_path, **kwargs)
+        if use_slicing:
+            self.vae.enable_slicing()
+        self.freeze = freeze
+        self.eval_mode = eval_mode
+        if self.freeze:
+            self.requires_grad_(False)
+        if self.eval_mode:
+            self.eval()
+        self._compiled_encode = None
+        self._compiled_decode = None
+        if compile_forward:
+            self._compiled_encode = torch.compile(self._encode, **compile_kwargs)
+            self._compiled_decode = torch.compile(self._decode, **compile_kwargs)
+
+    def train(self, mode=True):
+        mode = mode and (not self.eval_mode)
+        return super().train(mode)
+
+    def _encode(self, img, sample_mode='sample'):
         device = img.device
         dtype = img.dtype
         latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(
@@ -196,7 +406,7 @@ class PretrainedVAEQwenImage(nn.Module):
             raise ValueError(f'Invalid sample_mode: {sample_mode}')
         return ((latents - latents_mean) / latents_std).squeeze(-3)
 
-    def decode(self, code):
+    def _decode(self, code):
         device = code.device
         dtype = code.dtype
         latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=dtype).view(
@@ -204,6 +414,16 @@ class PretrainedVAEQwenImage(nn.Module):
         latents_std = torch.tensor(self.vae.config.latents_std, device=device, dtype=dtype).view(
             1, self.vae.config.z_dim, 1, 1, 1)
         return self.vae.decode(code.unsqueeze(-3) * latents_std + latents_mean, return_dict=False)[0].squeeze(-3)
+
+    def encode(self, img, sample_mode='sample'):
+        if self._compiled_encode is not None:
+            return self._compiled_encode(img, sample_mode=sample_mode)
+        return self._encode(img, sample_mode=sample_mode)
+
+    def decode(self, code):
+        if self._compiled_decode is not None:
+            return self._compiled_decode(code)
+        return self._decode(code)
 
 
 @MODULES.register_module()
@@ -214,6 +434,11 @@ class PretrainedVAEFlux2(nn.Module):
                  freeze=True,
                  eval_mode=True,
                  torch_dtype='float32',
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='default',
+                     fullgraph=True,
+                     dynamic=False),
                  **kwargs):
         super().__init__()
         if torch_dtype is not None:
@@ -227,13 +452,15 @@ class PretrainedVAEFlux2(nn.Module):
             self.requires_grad_(False)
         if self.eval_mode:
             self.eval()
+        self._compiled_encode = None
+        self._compiled_decode = None
+        if compile_forward:
+            self._compiled_encode = torch.compile(self._encode, **compile_kwargs)
+            self._compiled_decode = torch.compile(self._decode, **compile_kwargs)
 
     def train(self, mode=True):
         mode = mode and (not self.eval_mode)
         return super().train(mode)
-
-    def forward(self, *args, **kwargs):
-        return self.vae(*args, return_dict=False, **kwargs)[0]
 
     @staticmethod
     def _patchify_latents(latents):
@@ -251,7 +478,7 @@ class PretrainedVAEFlux2(nn.Module):
         latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), height * 2, width * 2)
         return latents
 
-    def encode(self, img, sample_mode='sample'):
+    def _encode(self, img, sample_mode='sample'):
         latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(
             device=img.device, dtype=img.dtype)
         latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
@@ -266,13 +493,121 @@ class PretrainedVAEFlux2(nn.Module):
         latents = (self._patchify_latents(latents) - latents_bn_mean) / latents_bn_std
         return self._unpatchify_latents(latents)
 
-    def decode(self, code):
+    def _decode(self, code):
         latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(
             device=code.device, dtype=code.dtype)
         latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
             device=code.device, dtype=code.dtype)
         latents = self._patchify_latents(code) * latents_bn_std + latents_bn_mean
         return self.vae.decode(self._unpatchify_latents(latents), return_dict=False)[0]
+
+    def encode(self, img, sample_mode='sample'):
+        if self._compiled_encode is not None:
+            return self._compiled_encode(img, sample_mode=sample_mode).clone()
+        return self._encode(img, sample_mode=sample_mode)
+
+    def decode(self, code):
+        if self._compiled_decode is not None:
+            return self._compiled_decode(code).clone()
+        return self._decode(code)
+
+
+@MODULES.register_module()
+class PretrainedMiniMaxH3TextEncoder(nn.Module):
+
+    def __init__(self,
+                 model_name_or_path='MiniMaxAI/MiniMax-H3',
+                 freeze=True,
+                 eval_mode=True,
+                 torch_dtype='bfloat16',
+                 max_sequence_length=1024,
+                 pad_to_multiple_of=256,
+                 trim_output=True,
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='default',
+                     fullgraph=True,
+                     dynamic=False),
+                 **kwargs):
+        super().__init__()
+        self.max_sequence_length = max_sequence_length
+        self.pad_to_multiple_of = pad_to_multiple_of
+        self.trim_output = trim_output
+        text_encoder_step = hf_modular_model_loader(
+            MiniMaxH3TextEncoderStep(),
+            model_name_or_path,
+            torch_dtype=getattr(torch, torch_dtype),
+            **kwargs)
+        self.text_encoder = text_encoder_step.text_encoder
+        self.tokenizer = text_encoder_step.tokenizer
+        self.text_encoder_layer = text_encoder_step.text_encoder_layer
+        self.freeze = freeze
+        self.eval_mode = eval_mode
+        if self.freeze:
+            self.requires_grad_(False)
+        if self.eval_mode:
+            self.eval()
+        self._compiled_forward = None
+        self._warmed_up = set()
+        if compile_forward:
+            # Transformers' lazy hidden-state hook installation cannot run inside fullgraph compile.
+            maybe_install_capturing_hooks(self.text_encoder.model.language_model)
+            self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
+
+    def train(self, mode=True):
+        return super().train(mode and not self.eval_mode)
+
+    @property
+    def _grad_enabled(self):
+        return torch.is_grad_enabled() and not self.freeze
+
+    def _forward_impl(self, input_ids, attention_mask):
+        # Explicit text positions avoid Qwen3-VL's data-dependent multimodal layout.
+        position_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)
+        outputs = self.text_encoder.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_hidden_states=True)
+        return outputs.hidden_states[self.text_encoder_layer]
+
+    def _warmup_shapes(self, input_ids):
+        for length in range(self.pad_to_multiple_of, self.max_sequence_length + 1, self.pad_to_multiple_of):
+            padded = input_ids.new_full((input_ids.size(0), length), self.tokenizer.pad_token_id)
+            self._compiled_forward(padded, torch.ones_like(padded))
+        self._warmed_up.add(input_ids.size(0))
+
+    def forward(self, prompt):
+        tokens = self.tokenizer(
+            prompt,
+            add_special_tokens=False,
+            padding=True,
+            padding_side='left',
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            max_length=self.max_sequence_length,
+            truncation=True,
+            return_tensors='pt')
+        device = next(self.text_encoder.parameters()).device
+        input_ids, attention_mask = tokens.input_ids.to(device), tokens.attention_mask.to(device)
+        if input_ids.size(1) == 0:
+            input_ids = input_ids.new_full((input_ids.size(0), self.pad_to_multiple_of), self.tokenizer.pad_token_id)
+            attention_mask = torch.zeros_like(input_ids)
+        with torch.set_grad_enabled(self._grad_enabled):
+            if self._compiled_forward is not None:
+                if is_warmup() and input_ids.size(0) not in self._warmed_up:
+                    self._warmup_shapes(input_ids)
+                prompt_embeds = self._compiled_forward(input_ids, attention_mask)
+            else:
+                prompt_embeds = self._forward_impl(input_ids, attention_mask)
+        prompt_embeds = prompt_embeds * attention_mask[..., None].to(prompt_embeds.dtype)
+        if not self.trim_output:
+            pad = self.max_sequence_length - prompt_embeds.size(1)
+            prompt_embeds = F.pad(prompt_embeds, (0, 0, pad, 0))
+            attention_mask = F.pad(attention_mask, (pad, 0))
+        return dict(
+            encoder_hidden_states=prompt_embeds,
+            encoder_hidden_states_mask=attention_mask)
 
 
 @MODULES.register_module()
@@ -416,6 +751,44 @@ class PretrainedStableDiffusion3TextEncoder(nn.Module):
 
 
 @MODULES.register_module()
+class PretrainedWanTextEncoder(nn.Module):
+    def __init__(self,
+                 model_name_or_path='Wan-AI/Wan2.1-T2V-14B-Diffusers',
+                 freeze=True,
+                 eval_mode=True,
+                 torch_dtype='bfloat16',
+                 max_sequence_length=512,
+                 **kwargs):
+        super().__init__()
+        self.max_sequence_length = max_sequence_length
+        self.pipeline = hf_model_loader(
+            WanPipeline,
+            model_name_or_path,
+            scheduler=None,
+            vae=None,
+            transformer=None,
+            transformer_2=None,
+            torch_dtype=getattr(torch, torch_dtype),
+            **kwargs)
+        self.text_encoder = self.pipeline.text_encoder
+        self.freeze = freeze
+        self.eval_mode = eval_mode
+        if self.freeze:
+            self.requires_grad_(False)
+        if self.eval_mode:
+            self.eval()
+
+    def train(self, mode=True):
+        mode = mode and (not self.eval_mode)
+        return super().train(mode)
+
+    def forward(self, prompt):
+        prompt_embeds, _ = self.pipeline.encode_prompt(
+            prompt, do_classifier_free_guidance=False, max_sequence_length=512)
+        return dict(encoder_hidden_states=prompt_embeds)
+
+
+@MODULES.register_module()
 class PretrainedFlux2TextEncoder(nn.Module):
     def __init__(self,
                  model_name_or_path='black-forest-labs/FLUX.2-dev',
@@ -451,6 +824,122 @@ class PretrainedFlux2TextEncoder(nn.Module):
             prompt, max_sequence_length=self.max_sequence_length)
         return dict(
             encoder_hidden_states=prompt_embeds)
+
+
+@MODULES.register_module()
+class PretrainedKrea2TextEncoder(nn.Module):
+    def __init__(self,
+                 model_name_or_path='krea/Krea-2-Raw',
+                 freeze=True,
+                 eval_mode=True,
+                 torch_dtype='bfloat16',
+                 max_sequence_length=512,
+                 pad_to_multiple_of=256,
+                 trim_output=True,
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='default',
+                     fullgraph=True,
+                     dynamic=False),
+                 **kwargs):
+        super().__init__()
+        self.max_sequence_length = max_sequence_length
+        self.pad_to_multiple_of = pad_to_multiple_of
+        self.trim_output = trim_output
+        pipeline = hf_model_loader(
+            Krea2Pipeline,
+            model_name_or_path,
+            scheduler=None,
+            vae=None,
+            transformer=None,
+            torch_dtype=getattr(torch, torch_dtype),
+            **kwargs)
+        self.text_encoder = pipeline.text_encoder
+        self.tokenizer = pipeline.tokenizer
+        self.text_encoder_select_layers = pipeline.text_encoder_select_layers
+        self.prompt_template_encode_prefix = pipeline.prompt_template_encode_prefix
+        self.prompt_template_encode_suffix = pipeline.prompt_template_encode_suffix
+        self.prompt_template_encode_start_idx = pipeline.prompt_template_encode_start_idx
+        self.prompt_template_encode_num_suffix_tokens = pipeline.prompt_template_encode_num_suffix_tokens
+        self.freeze = freeze
+        self.eval_mode = eval_mode
+        if self.freeze:
+            self.requires_grad_(False)
+        if self.eval_mode:
+            self.eval()
+        self._compiled_forward = None
+        self._warmed_up = set()
+        if compile_forward:
+            # Transformers' lazy hidden-state hook installation cannot run inside fullgraph compile.
+            maybe_install_capturing_hooks(self.text_encoder.language_model)
+            self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
+
+    def train(self, mode=True):
+        mode = mode and (not self.eval_mode)
+        return super().train(mode)
+
+    @property
+    def _grad_enabled(self):
+        return torch.is_grad_enabled() and not self.freeze
+
+    def _forward_impl(self, input_ids, attention_mask):
+        position_ids = (attention_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_hidden_states=True)
+        hidden_states = torch.stack([outputs.hidden_states[i] for i in self.text_encoder_select_layers], dim=2)
+        return hidden_states[:, self.prompt_template_encode_start_idx:]
+
+    def _warmup_shapes(self, input_ids):
+        for length in range(self.pad_to_multiple_of, self.max_sequence_length + 1, self.pad_to_multiple_of):
+            padded = input_ids.new_full(
+                (input_ids.size(0), length + self.prompt_template_encode_start_idx), self.tokenizer.pad_token_id)
+            self._compiled_forward(padded, torch.ones_like(padded, dtype=torch.bool))
+        self._warmed_up.add(input_ids.size(0))
+
+    def forward(self, prompt):
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        prefix_idx = self.prompt_template_encode_start_idx
+        suffix_len = self.prompt_template_encode_num_suffix_tokens
+        text = [self.prompt_template_encode_prefix + e for e in prompt]
+        text_tokens = self.tokenizer(
+            text,
+            truncation=True,
+            padding=True,
+            padding_side='right',
+            max_length=self.max_sequence_length + prefix_idx - suffix_len,
+            return_tensors='pt')
+        suffix_tokens = self.tokenizer([self.prompt_template_encode_suffix] * len(text), return_tensors='pt')
+        seq_len = text_tokens.input_ids.size(1) - prefix_idx + suffix_len
+        seq_len = min(
+            (seq_len + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of * self.pad_to_multiple_of,
+            self.max_sequence_length)
+        pad = seq_len + prefix_idx - suffix_len - text_tokens.input_ids.size(1)
+        input_ids = torch.cat([
+            F.pad(text_tokens.input_ids, (0, pad), value=self.tokenizer.pad_token_id), suffix_tokens.input_ids], dim=1)
+        attention_mask = torch.cat([
+            F.pad(text_tokens.attention_mask, (0, pad)), suffix_tokens.attention_mask], dim=1).bool()
+        device = next(self.text_encoder.parameters()).device
+        input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+        with torch.set_grad_enabled(self._grad_enabled):
+            if self._compiled_forward is not None:
+                if is_warmup() and input_ids.size(0) not in self._warmed_up:
+                    self._warmup_shapes(input_ids)
+                prompt_embeds = self._compiled_forward(input_ids, attention_mask)
+            else:
+                prompt_embeds = self._forward_impl(input_ids, attention_mask)
+        attention_mask = attention_mask[:, prefix_idx:]
+        if not self.trim_output:
+            pad = self.max_sequence_length - prompt_embeds.size(1)
+            prompt_embeds = F.pad(prompt_embeds, (0, 0, 0, 0, pad, 0))
+            attention_mask = F.pad(attention_mask, (pad, 0))
+        return dict(
+            encoder_hidden_states=prompt_embeds,
+            encoder_hidden_states_mask=attention_mask)
 
 
 @MODULES.register_module()
@@ -499,6 +988,11 @@ class PretrainedFlux2KleinTextEncoder(nn.Module):
                  eval_mode=True,
                  torch_dtype='bfloat16',
                  max_sequence_length=512,
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='default',
+                     fullgraph=True,
+                     dynamic=False),
                  **kwargs):
         super().__init__()
         self.max_sequence_length = max_sequence_length
@@ -517,14 +1011,23 @@ class PretrainedFlux2KleinTextEncoder(nn.Module):
             self.requires_grad_(False)
         if self.eval_mode:
             self.eval()
+        if compile_forward:
+            # Transformers' lazy hidden-state hook installation cannot run inside fullgraph compile.
+            maybe_install_capturing_hooks(self.text_encoder.model)
+            self.text_encoder.compile(**compile_kwargs)
 
     def train(self, mode=True):
         mode = mode and (not self.eval_mode)
         return super().train(mode)
 
+    @property
+    def _grad_enabled(self):
+        return torch.is_grad_enabled() and not self.freeze
+
     def forward(self, prompt):
-        prompt_embeds, text_ids = self.pipeline.encode_prompt(
-            prompt, max_sequence_length=self.max_sequence_length)
+        with torch.set_grad_enabled(self._grad_enabled):
+            prompt_embeds, text_ids = self.pipeline.encode_prompt(
+                prompt, max_sequence_length=self.max_sequence_length)
         return dict(
             encoder_hidden_states=prompt_embeds)
 
@@ -563,6 +1066,11 @@ class PretrainedRAE(nn.Module):
                  freeze=True,
                  eval_mode=True,
                  torch_dtype='float32',
+                 compile_forward=False,
+                 compile_kwargs=dict(
+                     mode='reduce-overhead',
+                     fullgraph=True,
+                     dynamic=False),
                  **kwargs):
         super().__init__()
         if torch_dtype is not None:
@@ -580,20 +1088,32 @@ class PretrainedRAE(nn.Module):
             self.requires_grad_(False)
         if self.eval_mode:
             self.eval()
+        self._compiled_encode = None
+        self._compiled_decode = None
+        if compile_forward:
+            # Transformers' lazy hidden-state hook installation cannot run inside fullgraph compile.
+            maybe_install_capturing_hooks(self.vae.encoder)
+            self._compiled_encode = torch.compile(self._encode, **compile_kwargs)
+            self._compiled_decode = torch.compile(self._decode, **compile_kwargs)
 
     def train(self, mode=True):
         mode = mode and (not self.eval_mode)
         return super().train(mode)
 
-    def forward(self, img, *args, **kwargs):
-        img = ((img + 1) / 2).clamp(0, 1)
-        decoded = self.vae(img, *args, return_dict=False, **kwargs)[0].clamp(0, 1)
-        return decoded * 2 - 1
-
-    def encode(self, img):
+    def _encode(self, img):
         img = ((img + 1) / 2).clamp(0, 1)
         return self.vae.encode(img, return_dict=False)[0]
 
-    def decode(self, code):
+    def _decode(self, code):
         decoded = self.vae.decode(code, return_dict=False)[0].clamp(0, 1)
         return decoded * 2 - 1
+
+    def encode(self, img):
+        if self._compiled_encode is not None:
+            return self._compiled_encode(img).clone()
+        return self._encode(img)
+
+    def decode(self, code):
+        if self._compiled_decode is not None:
+            return self._compiled_decode(code).clone()
+        return self._decode(code)

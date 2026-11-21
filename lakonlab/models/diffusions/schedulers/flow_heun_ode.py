@@ -36,6 +36,7 @@ class FlowHeunODEScheduler(SchedulerMixin, ConfigMixin):
             base_logshift=0.5,
             max_logshift=1.15,
             terminal_sigma=None,
+            final_step_size_scale=1.0,
             max_raw_t=1.0,
             min_raw_t=0.0):
         sigmas = torch.from_numpy(1 - np.linspace(
@@ -48,6 +49,10 @@ class FlowHeunODEScheduler(SchedulerMixin, ConfigMixin):
         self.prev_derivative = None
         self.dt = None
         self.sample = None
+
+    @property
+    def num_timesteps(self):
+        return self.config.num_train_timesteps
 
     @property
     def step_index(self):
@@ -102,8 +107,10 @@ class FlowHeunODEScheduler(SchedulerMixin, ConfigMixin):
             assert num_inference_steps is not None, 'Either num_inference_steps or sigmas must be provided.'
             self.num_inference_steps = num_inference_steps
             sigmas = np.linspace(
-                self.config.max_raw_t, self.config.min_raw_t,
-                num_inference_steps, dtype=np.float32, endpoint=False)
+                self.config.max_raw_t,
+                (self.config.max_raw_t - self.config.min_raw_t) * self.config.final_step_size_scale / (
+                    num_inference_steps - 1 + self.config.final_step_size_scale) + self.config.min_raw_t,
+                num_inference_steps, dtype=np.float32)
         else:
             if num_inference_steps is not None:
                 assert len(sigmas) == num_inference_steps

@@ -12,9 +12,9 @@ import mmcv
 from io import BytesIO
 from PIL import Image
 from torch.utils.data import Dataset
-from mmcv.fileio import FileClient
 from mmcv.parallel import DataContainer as DC
 from lakonlab.utils import get_root_logger, locked_cache_path
+from lakonlab.utils.io_utils import FileClient
 from .builder import DATASETS
 
 
@@ -191,6 +191,9 @@ class ImageNet(Dataset):
                 else:
                     torch_data = torch.load(data_bytesio, map_location='cpu')
                 label = torch.as_tensor(torch_data['y'], dtype=torch.long)
+                if self.return_image_bytes:
+                    assert not self.random_flip
+                    data.update(image_bytes=DC(torch_data['image_bytes'], cpu_only=True))
                 if self.ignore_cached_latents:
                     assert 'image_bytes' in torch_data
                     img_data = Image.open(BytesIO(torch_data['image_bytes'])).convert('RGB')
@@ -215,6 +218,7 @@ class ImageNet(Dataset):
             elif ext.lower() in ('.jpg', '.jpeg', '.png'):
                 label = torch.tensor(self.all_labels[idx], dtype=torch.long)
                 if self.return_image_bytes:
+                    assert not self.random_flip
                     data.update(image_bytes=DC(data_bytes, cpu_only=True))
                 img_data = Image.open(data_bytesio).convert('RGB')
                 data.update(

@@ -8,6 +8,7 @@ import tempfile
 import uuid
 import shutil
 import re
+import warnings
 from typing import Union, Callable, Optional, List
 from collections import OrderedDict
 from tempfile import TemporaryDirectory
@@ -19,6 +20,7 @@ from torch.optim import Optimizer
 from torch.distributed.tensor import DTensor
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions, get_optimizer_state_dict
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp._common_utils import clean_tensor_name
 
 from safetensors.torch import load_file, load
 from diffusers.utils.hub_utils import _get_checkpoint_shard_files
@@ -119,7 +121,7 @@ def load_full_state_dict(module: nn.Module,
             f'missing keys in source state_dict: {", ".join(missing_keys)}\n')
 
     rank, _ = get_dist_info()
-    if len(err_msg) > 0 and rank == 0:
+    if len(err_msg) > 0 and (strict or rank == 0):
         err_msg.insert(
             0, 'The model and loaded state dict do not match exactly\n')
         err_msg = '\n'.join(err_msg)  # type: ignore
@@ -149,6 +151,7 @@ def exists_ckpt(filename):
 @CheckpointLoader.register_scheme(prefixes='s3://', force=True)
 def load_from_s3(filename, map_location=None):
     ext = os.path.splitext(filename)[-1].lower()
+    file_client = S3Backend()
 
     rank, ws = get_dist_info()
     if ws > 1:
@@ -168,21 +171,20 @@ def load_from_s3(filename, map_location=None):
 
     with locked_cache_path(tmp_file) as (local_path, exists):
         if not exists:
-            S3Backend().download_file(filename, local_path)
+            file_client.download_file(filename, local_path)
 
     # load the temporary file
     if ext == '.txt':
         # if the file is a text file, it contains the name to the actual checkpoint file
         with open(tmp_file, 'r') as f:
             _filename = f.read().strip()
-        filename = os.path.join(
+        filename = file_client.join_path(
             os.path.dirname(filename), _filename)  # get the actual checkpoint file path
         if ws > 1:
             dist.barrier()
         if local_rank == 0:
             os.remove(tmp_file)
         return load_from_s3(filename, map_location=map_location)
-
     elif ext == '.safetensors':
         ckpt = load_file(tmp_file, device=map_location)
     else:
@@ -373,7 +375,7 @@ def _save_to_state_dict(module, destination, prefix, keep_vars, trainable_only=F
                 param = param.detach()
             if isinstance(param, DTensor):
                 param = param.full_tensor()
-                if torch.distributed.get_rank() == 0:  # only save the full tensor on rank 0
+                if dist.get_rank() == 0:  # only save the full tensor on rank 0
                     if cpu_offload:
                         param = param.cpu()
                     destination[prefix + name] = param
@@ -390,6 +392,19 @@ def _save_to_state_dict(module, destination, prefix, keep_vars, trainable_only=F
             destination[prefix + name] = buf
 
 
+def get_buffer_keys(module, prefix=''):
+    """State-dict keys of buffers, named as get_state_dict names them."""
+    if isinstance(module, FSDP):  # FSDP1 names its full state dict without its wrapper prefixes
+        return {prefix + clean_tensor_name(name) for name, _ in module.named_buffers()}
+    if is_module_wrapper(module):
+        module = module.module
+    keys = {prefix + name for name, buf in module._buffers.items() if buf is not None}
+    for name, child in module._modules.items():
+        if child is not None:
+            keys |= get_buffer_keys(child, prefix + name + '.')
+    return keys
+
+
 def get_state_dict(module,
                    destination=None,
                    prefix='',
@@ -400,11 +415,23 @@ def get_state_dict(module,
         if trainable_only and all(not param.requires_grad for param in module.parameters()):
             return destination  # skip frozen module
 
-        with FSDP.state_dict_type(
-                module,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=cpu_offload, rank0_only=True)):
-            module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=FutureWarning, message='FSDP.state_dict_type')
+            with FSDP.state_dict_type(
+                    module,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=cpu_offload, rank0_only=True)):
+                destination = module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+        # FSDP returns its ignored parameters as is, e.g., lakonlab_no_shard or under ignore_frozen_parameters
+        for name, param in module.named_parameters():
+            key = prefix + clean_tensor_name(name)
+            if key not in destination:
+                continue
+            if trainable_only and not param.requires_grad:
+                destination.pop(key)
+            elif cpu_offload and dist.get_rank() == 0:  # only rank 0 saves (rank0_only)
+                destination[key] = destination[key].cpu()
 
     else:  # FSDP2, DDP, or non-distributed model
         # recursively check parallel module in case that the model has a
@@ -498,7 +525,7 @@ def write_checkpoint_to_file(checkpoint, filepath, create_symlink=False, after_s
         if create_symlink:
             # S3 does not support real symlinks, so we create a 'latest.txt'
             # containing the relative path of the latest checkpoint
-            dst_file = osp.join(osp.dirname(filepath), 'latest.txt')
+            dst_file = file_client.join_path(osp.dirname(filepath), 'latest.txt')
             file_client.put_text(osp.basename(filepath), dst_file)
 
     else:
@@ -543,19 +570,23 @@ def get_checkpoint(model,
         'meta': meta,
         'state_dict': get_state_dict(model, trainable_only=trainable_only, cpu_offload=True)}
     if fp16 or fp16_ema:
+        buffer_keys = get_buffer_keys(model)  # buffers stay fp32, e.g. running statistics beyond the fp16 range
         for k, v in checkpoint['state_dict'].items():
             if ((fp16 and '_ema.' not in k and '_ema2.' not in k) or (fp16_ema and ('_ema.' in k or '_ema2.' in k))) \
-                    and v.dtype == torch.float32:
+                    and v.dtype == torch.float32 and k not in buffer_keys:
                 checkpoint['state_dict'][k] = v.half()
 
     torch.cuda.empty_cache()
 
-    # save optimizer state dict in the checkpoint
+    # Skip untouched optimizers: DCP initializes empty state with a zero-gradient step.
     if isinstance(optimizer, Optimizer):
-        checkpoint['optimizer'] = get_optim_state_dict(model, optimizer, bf16_optim)
+        if optimizer.state:
+            checkpoint['optimizer'] = get_optim_state_dict(model, optimizer, bf16_optim)
     elif isinstance(optimizer, dict):
         checkpoint['optimizer'] = {}
         for name, optim in optimizer.items():
+            if not optim.state:
+                continue
             submodule = getattr(model, name)
             checkpoint['optimizer'][name] = get_optim_state_dict(submodule, optim, bf16_optim)
 

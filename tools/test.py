@@ -1,47 +1,29 @@
-import warnings
-
-# suppress warnings from MMCV about optional dependencies
-warnings.filterwarnings(
-    'ignore',
-    category=UserWarning,
-    message=r'^Fail to import ``MultiScaleDeformableAttention`` from ``mmcv\.ops\.multi_scale_deform_attn``.*',
-    module=r'^mmcv\.cnn\.bricks\.transformer$',
-)
-
 import os
 import sys
 import argparse
-import multiprocessing as mp
-import platform
+
+from lakonlab.utils.env import apply_default_env
+apply_default_env()
+
 import re
 from copy import deepcopy
 
 import torch
-from torch._inductor import config as torch_inductor_config
 
-# torch 2.11's slow cudagraph pool assertion snapshots storage liveness
-# before its internal gc.collect(), then compares against allocator state
-# after collection, which can report already-dead storages as phantom leaks.
-if torch.__version__.startswith('2.11.'):
-    torch_inductor_config.triton.slow_path_cudagraph_asserts = False
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-import cv2
 import mmcv
 from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import get_dist_info, init_dist, load_checkpoint
-from mmcv.fileio import FileClient
 
 from lakonlab.models import build_model
 from lakonlab.utils import get_root_logger
 from lakonlab.evaluation import build_metric
 from lakonlab.evaluation.eval_hooks import evaluate
-from lakonlab.datasets import build_dataset, build_dataloader, unique_dataloaders
+from lakonlab.datasets import build_dataset, build_dataloader, shared_parse_cache, unique_dataloaders
 from lakonlab.parallel.utils import prepare_module_wrapper, apply_module_wrapper
 from lakonlab.runner.checkpoint import exists_ckpt, clear_checkpoint_cache
+from lakonlab.utils import setup_global_config, setup_multi_processes
+from lakonlab.utils.io_utils import FileClient
 from lakonlab.runner.utils import set_random_seed
 
 
@@ -52,7 +34,7 @@ def parse_args():
     parser.add_argument('--ckpt', help='checkpoint file')
     parser.add_argument(
         '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi', 'flyte'],
+        choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
@@ -94,39 +76,6 @@ def parse_args():
     return args
 
 
-def setup_multi_processes(cfg):
-    # set multi-process start method as `fork` to speed up the training
-    if platform.system() != 'Windows':
-        mp_start_method = cfg.get('mp_start_method', 'fork')
-        if mp.get_start_method(allow_none=True) is None:
-            mp.set_start_method(mp_start_method)
-
-    # disable opencv multithreading to avoid system being overloaded
-    opencv_num_threads = cfg.get('opencv_num_threads', 0)
-    cv2.setNumThreads(opencv_num_threads)
-
-    # setup OMP threads
-    # This code is referred from https://github.com/pytorch/pytorch/blob/master/torch/distributed/run.py  # noqa
-    if ('OMP_NUM_THREADS' not in os.environ and cfg.data.workers_per_gpu > 1):
-        omp_num_threads = 1
-        warnings.warn(
-            f'Setting OMP_NUM_THREADS environment variable for each process '
-            f'to be {omp_num_threads} in default, to avoid your system being '
-            f'overloaded, please further tune the variable for optimal '
-            f'performance in your application as needed.')
-        os.environ['OMP_NUM_THREADS'] = str(omp_num_threads)
-
-    # setup MKL threads
-    if 'MKL_NUM_THREADS' not in os.environ and cfg.data.workers_per_gpu > 1:
-        mkl_num_threads = 1
-        warnings.warn(
-            f'Setting MKL_NUM_THREADS environment variable for each process '
-            f'to be {mkl_num_threads} in default, to avoid your system being '
-            f'overloaded, please further tune the variable for optimal '
-            f'performance in your application as needed.')
-        os.environ['MKL_NUM_THREADS'] = str(mkl_num_threads)
-
-
 def main():
     args = parse_args()
 
@@ -140,9 +89,7 @@ def main():
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings
         import_modules_from_strings(**cfg['custom_imports'])
-    # set cudnn_benchmark
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
+    setup_global_config(dict(cfg.get('global_config', dict())))
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
@@ -150,8 +97,7 @@ def main():
         rank = 0
     else:
         distributed = True
-        if args.launcher != 'flyte':  # flyte launcher already sets up the distributed environment
-            init_dist(args.launcher, **cfg.dist_params)
+        init_dist(args.launcher, **cfg.dist_params)
         rank, world_size = get_dist_info()
 
     log_path = None
@@ -199,26 +145,28 @@ def main():
     })
 
     # The specific datalaoder settings
-    _evaluation = []
-    eval_dataloaders = dict()
-    for eval_cfg_ in cfg.evaluation:
-        if args.data is not None:
-            if eval_cfg_.data not in args.data:
-                continue
-        if eval_cfg_.data in eval_dataloaders:
-            test_data_loader = eval_dataloaders[eval_cfg_.data]
-        else:
-            test_dataset = build_dataset(cfg.data[eval_cfg_.data])
-            test_loader_cfg = {
-                **loader_cfg,
-                **cfg.data.get('test_dataloader', dict())
-            }
-            test_data_loader = build_dataloader(test_dataset, **test_loader_cfg)
-            eval_dataloaders[eval_cfg_.data] = test_data_loader
-        eval_cfg = deepcopy(eval_cfg_)
-        eval_cfg.update(dataloader=test_data_loader)
-        _evaluation.append(eval_cfg)
-    cfg.evaluation = _evaluation
+    # datasets sharing metadata or datalists parse each file once; the cache is dropped before workers fork
+    with shared_parse_cache():
+        _evaluation = []
+        eval_dataloaders = dict()
+        for eval_cfg_ in cfg.evaluation:
+            if args.data is not None:
+                if eval_cfg_.data not in args.data:
+                    continue
+            if eval_cfg_.data in eval_dataloaders:
+                test_data_loader = eval_dataloaders[eval_cfg_.data]
+            else:
+                test_dataset = build_dataset(cfg.data[eval_cfg_.data])
+                test_loader_cfg = {
+                    **loader_cfg,
+                    **cfg.data.get('test_dataloader', dict())
+                }
+                test_data_loader = build_dataloader(test_dataset, **test_loader_cfg)
+                eval_dataloaders[eval_cfg_.data] = test_data_loader
+            eval_cfg = deepcopy(eval_cfg_)
+            eval_cfg.update(dataloader=test_data_loader)
+            _evaluation.append(eval_cfg)
+        cfg.evaluation = _evaluation
 
     # warm up dataloader workers
     for data_loader in unique_dataloaders(
@@ -252,11 +200,11 @@ def main():
     for eval_cfg in cfg.evaluation:
         viz_dir = eval_cfg.get('viz_dir', None)
         if viz_dir is not None:
-            if ckpt_name is not None:
-                viz_dir = os.path.join(viz_dir, ckpt_name)  # add ckpt name
-            else:
-                viz_dir = os.path.join(viz_dir, 'default')
             file_client = FileClient.infer_client(uri=viz_dir)
+            if ckpt_name is not None:
+                viz_dir = file_client.join_path(viz_dir, ckpt_name)  # add ckpt name
+            else:
+                viz_dir = file_client.join_path(viz_dir, 'default')
             html_path = file_client.join_path(
                 os.path.dirname(viz_dir), os.path.basename(viz_dir) + '.html')
             if args.skip_existing:
@@ -293,6 +241,8 @@ def main():
             viz_dir=viz_dir,
             viz_num=eval_cfg.get('viz_num', None),
             sample_kwargs=eval_cfg.get('sample_kwargs', dict()),
+            fps=eval_cfg.get('fps', 16),
+            sample_rate=eval_cfg.get('sample_rate', None),
             enable_timers=args.timer,
             reuse_viz=args.reuse_viz)
 
@@ -309,7 +259,8 @@ def main():
                 prefix_name = prefix + '_' + name if len(prefix) > 0 else name
                 mmcv.print_log(f'{eval_cfg.data}_{prefix_name} = {val}', 'lakonlab')
 
-    return
+    if distributed and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == '__main__':

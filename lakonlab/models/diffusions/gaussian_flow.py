@@ -1,21 +1,22 @@
 # Copyright (c) 2026 Hansheng Chen
 
-import sys
 import inspect
+import tqdm
 from typing import Optional
 from copy import deepcopy
 
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import FullyShardedDataParallel, FSDPModule
 import diffusers
+from diffusers.utils.torch_utils import randn_tensor
 
-import mmcv
 from mmcv.runner.fp16_utils import force_fp32
-
 from ..builder import MODULES, build_module
 from . import schedulers
 from lakonlab.models.architectures.utils import get_module_device
 from lakonlab.runner.timer import default_timers
+from lakonlab.utils import rgetattr
 
 
 @torch.jit.script
@@ -41,12 +42,13 @@ class GaussianFlow(nn.Module):
     def __init__(self,
                  denoising=None,
                  flow_loss=None,
+                 base_flow_loss=None,
                  repa_loss=None,
                  num_timesteps=1000,
                  timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0),
                  flip_model_timesteps=False,
                  denoising_mean_mode='U',
-                 sigma_min=1e-4,  # for training loss only, JiT uses 0.05
+                 sigma_min=1e-4,  # affects training loss clamping of all modes and inference clamping of X0 mode
                  train_cfg=None,
                  test_cfg=None):
         super().__init__()
@@ -66,6 +68,7 @@ class GaussianFlow(nn.Module):
             timestep_sampler,
             default_args=dict(num_timesteps=num_timesteps))
         self.flow_loss = build_module(flow_loss) if flow_loss is not None else None
+        self.base_flow_loss = build_module(base_flow_loss) if base_flow_loss is not None else None
 
         default_timers.add_timer('network time')
 
@@ -140,7 +143,16 @@ class GaussianFlow(nn.Module):
 
     def pred(self, x_t=None, t=None, **kwargs):
         ori_dtype = x_t.dtype
-        if hasattr(self.denoising, 'dtype'):
+        denoising_fsdp = next((
+            module for module in self.denoising.modules()
+            if isinstance(module, (FullyShardedDataParallel, FSDPModule))), None)
+        if isinstance(denoising_fsdp, FSDPModule):
+            mp_policy = denoising_fsdp._get_fsdp_state()._mp_policy
+        else:
+            mp_policy = getattr(denoising_fsdp, 'mixed_precision', None)
+        if mp_policy is not None and mp_policy.param_dtype is not None:
+            denoising_dtype = mp_policy.param_dtype
+        elif hasattr(self.denoising, 'dtype'):
             denoising_dtype = self.denoising.dtype
         else:
             denoising_dtype = next(self.denoising.parameters()).dtype
@@ -150,15 +162,21 @@ class GaussianFlow(nn.Module):
             t = t.expand(num_batches)
         if self.flip_model_timesteps:
             t = self.num_timesteps - t
+
         output = self.denoising(x_t, t, **kwargs)
+
+        extra = None
+        if isinstance(output, tuple):
+            output, extra = output
         if isinstance(output, dict):
             output = {k: v.to(ori_dtype) for k, v in output.items() if isinstance(v, torch.Tensor)}
         else:
             output = output.to(ori_dtype)
-        return output
+        return output if extra is None else (output, extra)
 
     @force_fp32()
-    def loss(self, denoising_output, x_0, noise, x_t, t):
+    def loss(self, denoising_output, x_0, noise, x_t, t, flow_loss=None):
+        flow_loss = self.flow_loss if flow_loss is None else flow_loss
         _, sigma_clamped, clamp_coef = self.get_clamp_coef(t=t, x_t=x_t)
         if self.denoising_mean_mode.upper() == 'U':
             u_t_pred = denoising_output * clamp_coef
@@ -172,7 +190,7 @@ class GaussianFlow(nn.Module):
             u_t_pred=u_t_pred,
             u_t=u_t,
             timesteps=t)
-        return self.flow_loss(loss_kwargs)
+        return flow_loss(loss_kwargs)
 
     def forward_train(
             self,
@@ -189,6 +207,9 @@ class GaussianFlow(nn.Module):
         max_raw_t = self.train_cfg.get('max_raw_t', 1.0)
         min_raw_t = self.train_cfg.get('min_raw_t', 0.0)
 
+        use_repa = self.repa_loss is not None and visual_encoder_features is not None
+        use_spectral_update = rgetattr(self.denoising, 'use_spectral_update', False)
+
         t = self.timestep_sampler(
             num_batches,
             seq_len=seq_len,
@@ -199,16 +220,28 @@ class GaussianFlow(nn.Module):
         noise = torch.randn_like(x_0)
         x_t, _, _ = self.sample_forward_diffusion(x_0, t, noise)
 
-        use_repa = self.repa_loss is not None and visual_encoder_features is not None
+        kwargs = kwargs.copy()
         if use_repa:
-            kwargs = kwargs.copy()
             kwargs.update(cache_mode='save', cache_config=self.repa_loss.cache_config)
-
+        if use_spectral_update:
+            _, _, clamp_coef = self.get_clamp_coef(t=t, x_t=x_t)
+            kwargs.update(x_0=x_0, noise=noise, loss_weight=clamp_coef.square().flatten())
         denoising_output = self.pred(x_t, t, **kwargs)
+
+        base_denoising_output = None
+        if rgetattr(self.denoising, 'use_internal_guidance', False):
+            base_denoising_output, denoising_output = denoising_output.chunk(2, dim=0)
+
         loss_diffusion = self.loss(denoising_output, x_0, noise, x_t, t)
         loss = loss_diffusion
         log_vars = self.flow_loss.log_vars.copy()
         log_vars.update(loss_diffusion=loss_diffusion.detach())
+
+        if base_denoising_output is not None and self.base_flow_loss is not None:
+            loss_base_diffusion = self.loss(base_denoising_output, x_0, noise, x_t, t, flow_loss=self.base_flow_loss)
+            loss = loss + loss_base_diffusion
+            log_vars.update(self.base_flow_loss.log_vars)
+            log_vars.update(loss_base_diffusion=loss_base_diffusion.detach())
 
         if use_repa:
             pred_features = self.denoising.get_cache_hidden_states()
@@ -219,28 +252,18 @@ class GaussianFlow(nn.Module):
 
         return loss, log_vars
 
-    def forward_test(
-            self, x_0=None, noise=None, guidance_scale=1.0,
-            test_cfg_override=dict(), show_pbar=False, sample_callback=None, **kwargs):
-        x_t = torch.randn_like(x_0) if noise is None else noise
-        num_batches = x_t.size(0)
-        ori_dtype = x_t.dtype
-        x_t = x_t.float()
-
-        cfg = deepcopy(self.test_cfg)
-        cfg.update(test_cfg_override)
-        sample_callback = cfg.pop('sample_callback', sample_callback)
-
-        sampler = cfg.get('sampler', 'FlowEulerODE')
+    def _build_sampler(self, x_t, cfg, default_sampler='FlowEulerODE'):
+        sampler = cfg.get('sampler', default_sampler)
         sampler_class = getattr(diffusers.schedulers, sampler + 'Scheduler', None)
         if sampler_class is None:
             sampler_class = getattr(schedulers, sampler + 'Scheduler', None)
         if sampler_class is None:
             raise AttributeError(f'Cannot find sampler [{sampler}].')
 
-        sampler_kwargs = cfg.get('sampler_kwargs', {})
+        sampler_kwargs = deepcopy(cfg.get('sampler_kwargs', {}))
         signatures = inspect.signature(sampler_class).parameters.keys()
-        for key in ['shift', 'use_dynamic_shifting', 'base_seq_len', 'max_seq_len', 'base_logshift', 'max_logshift']:
+        for key in ['shift', 'use_dynamic_shifting', 'dynamic_shifting_type',
+                    'base_seq_len', 'max_seq_len', 'base_logshift', 'max_logshift']:
             if key in signatures and key not in sampler_kwargs:
                 sampler_kwargs[key] = cfg.get(key, getattr(self.timestep_sampler, key))
         if 'flow_shift' in signatures and 'use_flow_sigmas' in signatures:
@@ -248,47 +271,67 @@ class GaussianFlow(nn.Module):
             sampler_kwargs['use_flow_sigmas'] = True
             if 'flow_shift' not in sampler_kwargs:
                 sampler_kwargs['flow_shift'] = cfg.get('shift', self.timestep_sampler.shift)
-        for key in ['max_raw_t', 'min_raw_t']:
+        for key in ['final_step_size_scale', 'max_raw_t', 'min_raw_t']:
             if key in signatures and key in cfg and key not in sampler_kwargs:
                 sampler_kwargs[key] = cfg[key]
         sampler = sampler_class(self.num_timesteps, **sampler_kwargs)
 
-        num_timesteps = cfg.get('num_timesteps', None)
         sigmas = cfg.get('sigmas', None)
+        num_timesteps = None
+        if sigmas is None:
+            num_timesteps = cfg.get('num_timesteps', cfg.get('nfe', None))
+        if 'seq_len' in inspect.signature(sampler.set_timesteps).parameters:
+            seq_len = x_t.shape[2:].numel()  # h * w or t * h * w
+            sampler.set_timesteps(num_timesteps, sigmas=sigmas, seq_len=seq_len, device=x_t.device)
+        else:
+            sampler.set_timesteps(num_timesteps, sigmas=sigmas, device=x_t.device)
+
+        return sampler
+
+    def forward_test(
+            self, x_0=None, noise=None, guidance_scale=1.0,
+            test_cfg_override=dict(), show_pbar=False, sample_callback=None,
+            stop_at_step=None, generator=None, tqdm_cls=tqdm.tqdm, **kwargs):
+        x_t = randn_tensor(
+            x_0.shape, dtype=x_0.dtype, device=x_0.device, generator=generator) if noise is None else noise
+        num_batches = x_t.size(0)
+        ori_dtype = x_t.dtype
+        x_t = x_t.float()
+
+        cfg = deepcopy(self.test_cfg)
+        cfg.update(deepcopy(test_cfg_override))
+
         guidance_interval = cfg.get('guidance_interval', [0, self.num_timesteps])
         orthogonal_guidance = cfg.get('orthogonal_guidance', 0.0)
+        use_internal_guidance = rgetattr(self.denoising, 'use_internal_guidance', False)
         use_guidance = guidance_scale > 1.0
         if use_guidance:
             guidance_scale = x_t.new_tensor(  # to tensor
                 [guidance_scale]
             ).expand(num_batches).reshape([num_batches] + [1] * (x_t.dim() - 1))
 
-        set_timesteps_signatures = inspect.signature(sampler.set_timesteps).parameters.keys()
-        seq_len = x_t.shape[2:].numel()  # h * w or t * h * w
-        if 'seq_len' in set_timesteps_signatures:
-            sampler.set_timesteps(num_timesteps, sigmas=sigmas, seq_len=seq_len, device=x_t.device)
-        else:
-            sampler.set_timesteps(num_timesteps, sigmas=sigmas, device=x_t.device)
-
+        sampler = self._build_sampler(x_t, cfg)
         timesteps = sampler.timesteps
 
-        x_t = timesteps[0] / self.num_timesteps * x_t
+        pbar = tqdm_cls(None, total=len(timesteps)) if show_pbar else tqdm.tqdm(disable=True)
 
-        if show_pbar:
-            pbar = mmcv.ProgressBar(len(timesteps))
-
-        for t in timesteps:
+        step_id = -1
+        for step_id, t in enumerate(timesteps[:stop_at_step]):
             x_t_input = x_t
-            _kwargs = kwargs
             if use_guidance:
                 x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
 
             with default_timers['network time']:
-                denoising_output = self.pred(x_t_input, t, **_kwargs)
+                denoising_output = self.pred(
+                    x_t if use_internal_guidance else x_t_input,
+                    t,
+                    **kwargs)
+            if use_internal_guidance and not use_guidance:
+                _, denoising_output = denoising_output.chunk(2, dim=0)
 
             if self.denoising_mean_mode.upper() == 'X0':
-                _, sigma_clamped, _ = self.get_clamp_coef(t=t, x_t=x_t_input)
-                denoising_output = (x_t_input - denoising_output) / sigma_clamped
+                denoising_output = self.x_0_to_u(
+                    denoising_output, x_t_input, t=t, eps=self.sigma_min)
 
             if use_guidance:
                 _guidance_scale = guidance_scale
@@ -299,23 +342,22 @@ class GaussianFlow(nn.Module):
                 bias = guidance_jit(
                     mean_pos, mean_neg, _guidance_scale,
                     orthogonal_guidance,
-                    self.u_to_x_0(mean_pos, x_t, t)
+                    self.u_to_x_0(mean_pos, x_t, t) if orthogonal_guidance != 0.0 else None
                 )
                 denoising_output = mean_pos + bias
 
             if sample_callback is not None:
                 callback_outputs = sample_callback(
-                    self, dict(x_t=x_t, denoising_output=denoising_output, t=t))
+                    self, dict(x_t=x_t, u=denoising_output, t=t))
                 x_t = callback_outputs.get('x_t', x_t)
-                denoising_output = callback_outputs.get('denoising_output', denoising_output)
+                denoising_output = callback_outputs.get('u', denoising_output)
 
-            x_t = sampler.step(denoising_output, t, x_t, return_dict=False)[0]
+            x_t = sampler.step(denoising_output, t, x_t, generator=generator, return_dict=False)[0]
 
-            if show_pbar:
-                pbar.update()
+            pbar.update()
 
-        if show_pbar:
-            sys.stdout.write('\n')
+        if stop_at_step is not None:
+            return x_t, timesteps[step_id + 1]
 
         return x_t.to(ori_dtype)
 
@@ -327,12 +369,15 @@ class GaussianFlow(nn.Module):
 
         orthogonal_guidance = test_cfg.get('orthogonal_guidance', 0.0)
         guidance_interval = test_cfg.get('guidance_interval', [0, self.num_timesteps])
+        use_internal_guidance = rgetattr(self.denoising, 'use_internal_guidance', False)
 
         use_guidance = guidance_scale > 1.0
 
         x_t_input = x_t
         t_input = t
         if use_guidance:
+            x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
+            t_input = torch.cat([t_input, t_input], dim=0)
             guidance_scale = x_t.new_tensor(
                 [guidance_scale]
             ).expand(num_batches).reshape([num_batches] + [1] * (x_t.dim() - 1))
@@ -343,31 +388,48 @@ class GaussianFlow(nn.Module):
                 guidance_scale,
                 torch.ones_like(guidance_scale)
             )
-            x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
-            t_input = torch.cat([t_input, t_input], dim=0)
 
-        denoising_output = self.pred(x_t_input, t_input, **kwargs)
+        denoising_output = self.pred(
+            x_t if use_internal_guidance else x_t_input,
+            t if use_internal_guidance else t_input,
+            **kwargs)
+        if use_internal_guidance and not use_guidance:
+            _, denoising_output = denoising_output.chunk(2, dim=0)
 
         if self.denoising_mean_mode.upper() == 'X0':
-            _, sigma_clamped, _ = self.get_clamp_coef(t=t_input, x_t=x_t_input)
-            denoising_output = (x_t_input - denoising_output) / sigma_clamped
+            denoising_output = self.x_0_to_u(
+                denoising_output, x_t_input, t=t_input, eps=self.sigma_min)
 
         if use_guidance:
             mean_neg, mean_pos = denoising_output.chunk(2, dim=0)
             bias = guidance_jit(
                 mean_pos, mean_neg, guidance_scale,
-                orthogonal_guidance, self.u_to_x_0(mean_pos, x_t, t))
+                orthogonal_guidance,
+                self.u_to_x_0(mean_pos, x_t, t) if orthogonal_guidance != 0.0 else None
+            )
             denoising_output = mean_pos + bias
 
         if sample_callback is not None:
             callback_outputs = sample_callback(
-                self, dict(x_t=x_t, denoising_output=denoising_output, t=t))
-            denoising_output = callback_outputs.get('denoising_output', denoising_output)
+                self, dict(x_t=x_t, u=denoising_output, t=t))
+            denoising_output = callback_outputs.get('u', denoising_output)
 
         return denoising_output.to(ori_dtype)
 
     def forward_x_0(self, x_t=None, t=None, t_dst=None, **kwargs):
-        raise NotImplementedError
+        ori_dtype = x_t.dtype
+        x_t = x_t.float()
+        u = self.forward_u(x_t=x_t, t=t, **kwargs)
+        t = t.reshape(*t.size(), *((x_t.dim() - t.dim()) * [1]))
+        sigma = t / self.num_timesteps
+        x_0 = self.u_to_x_0(u, x_t, sigma=sigma)
+        if t_dst is None:
+            return x_0.to(ori_dtype)
+        else:
+            t_dst = t_dst.reshape(*t_dst.size(), *((x_t.dim() - t_dst.dim()) * [1]))
+            sigma_dst = t_dst / self.num_timesteps
+            x_t_dst = x_t - (sigma - sigma_dst) * u
+            return x_0.to(ori_dtype), x_t_dst.to(ori_dtype)
 
     def forward(
             self,

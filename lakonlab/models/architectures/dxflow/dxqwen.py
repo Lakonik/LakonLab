@@ -1,17 +1,17 @@
 import torch
 
 from accelerate import init_empty_weights
-from diffusers.models import QwenImageTransformer2DModel
 from peft import LoraConfig
 
 from ...builder import MODULES
+from ..diffusers.qwen import _QwenImageTransformer2DModelFix
 from ..utils import flex_freeze
 from lakonlab.utils import get_root_logger
 from lakonlab.runner.checkpoint import _load_cached_checkpoint, load_full_state_dict
 
 
 @MODULES.register_module()
-class DXQwenImageTransformer2DModel(QwenImageTransformer2DModel):
+class DXQwenImageTransformer2DModel(_QwenImageTransformer2DModelFix):
 
     def __init__(
             self,
@@ -103,7 +103,7 @@ class DXQwenImageTransformer2DModel(QwenImageTransformer2DModel):
                 load_full_state_dict(self, state_dict, logger=logger, assign=True)
                 if len(lora_state_dict) > 0:
                     self.load_lora_adapter(lora_state_dict, prefix=None)
-                    self.fuse_lora()
+                    self.fuse_lora(safe_fusing=True)
                     self.unload_lora()
                     self.requires_grad_(True)  # PEFT freezes the weights after fusing
             else:
@@ -154,8 +154,7 @@ class DXQwenImageTransformer2DModel(QwenImageTransformer2DModel):
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             timestep=timestep,
             img_shapes=img_shapes,
-            return_dict=False,
-            **kwargs)[0]
+            **kwargs)
 
         extra_dim = max(self.n_grid, self.p_order)
         output = output.permute(0, 2, 1).reshape(bs, extra_dim, self.out_channels // extra_dim, h, w)

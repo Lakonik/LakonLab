@@ -1,11 +1,14 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.embeddings import PatchEmbed
+from mmcv.cnn import constant_init
 
 from ...builder import MODULES
 from ..diffusers.dit import LabelEmbeddingMod
-from ..utils import flex_freeze
+from ..utils import flex_freeze, fp32_module_forward
 from .modules import (
+    GaussianFourierEmbedding,
     VisionRotaryEmbeddingFast,
     LightningDDTBlock,
     DDTFinalLayer,
@@ -14,30 +17,8 @@ from lakonlab.utils import get_root_logger
 from lakonlab.runner.checkpoint import _load_cached_checkpoint, load_full_state_dict
 
 
-class GaussianFourierEmbedding(nn.Module):
-    def __init__(self, hidden_size, embedding_size=256, scale=1.0):
-        super().__init__()
-        self.embedding_size = embedding_size
-        self.scale = scale
-        self.register_buffer('W', torch.normal(0, self.scale, (embedding_size,)))
-        self.mlp = nn.Sequential(
-            nn.Linear(embedding_size * 2, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
+class _LightningDDT(nn.Module):
 
-    @property
-    def dtype(self):
-        return next(self.mlp.parameters()).dtype
-
-    def forward(self, t):
-        t = 2 * torch.pi * t[:, None] * self.W[None, :]
-        t_embed = torch.cat([torch.sin(t), torch.cos(t)], dim=-1).to(self.dtype)
-        return self.mlp(t_embed)
-
-
-@MODULES.register_module()
-class LightningDDT(nn.Module):
     def __init__(
             self,
             input_size=16,
@@ -54,17 +35,6 @@ class LightningDDT(nn.Module):
             use_rmsnorm=True,
             wo_shift=False,
             use_pos_embed=True,
-            freeze=False,
-            freeze_exclude=[],
-            pretrained=None,
-            torch_dtype='float32',
-            compile_forward=False,
-            compile_kwargs=dict(
-                mode='reduce-overhead',
-                fullgraph=True,
-                dynamic=False),
-            freeze_exclude_fp32=True,
-            freeze_exclude_autocast_dtype=None,
             checkpointing=True):
         super().__init__()
         self.in_channels = in_channels
@@ -147,33 +117,23 @@ class LightningDDT(nn.Module):
         self.final_layer = DDTFinalLayer(
             self.decoder_hidden_size, self.x_patch_size, self.out_channels, use_rmsnorm=use_rmsnorm)
 
-        self.init_weights(pretrained)
-
-        if torch_dtype is not None:
-            self.to(getattr(torch, torch_dtype))
-
-        self.freeze = freeze
-        if self.freeze:
-            flex_freeze(
-                self,
-                exclude_keys=freeze_exclude,
-                exclude_fp32=freeze_exclude_fp32,
-                exclude_autocast_dtype=freeze_exclude_autocast_dtype,
-            )
-
         self.gradient_checkpointing = checkpointing
-        self._compiled_forward = None
-        if compile_forward:
-            self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
 
-    def init_weights(self, pretrained):
-        if pretrained is not None:
-            logger = get_root_logger()
-            state_dict = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
-            # Convert original state dict to match diffusers' PatchEmbed
-            if 'pos_embed' in state_dict and 's_embedder.pos_embed' not in state_dict:
-                state_dict['s_embedder.pos_embed'] = state_dict.pop('pos_embed')
-            load_full_state_dict(self, state_dict)
+    def init_weights(self):
+        for embedder in [self.x_embedder, self.s_embedder]:
+            w = embedder.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(embedder.proj.bias, 0)
+
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        for block in self.blocks:
+            constant_init(block.adaLN_modulation[-1], val=0)
+
+        constant_init(self.final_layer.adaLN_modulation[-1], val=0)
+        constant_init(self.final_layer.linear, val=0)
 
     def _apply_blocks(self, x, block_indices, cond, feat_rope):
         for i in block_indices:
@@ -188,31 +148,105 @@ class LightningDDT(nn.Module):
                 x = block(x, cond, feat_rope=feat_rope)
         return x
 
-    def _forward_impl(self, x, timestep=None, class_labels=None, s=None):
-        t = self.t_embedder(timestep)
-        y = self.y_embedder(class_labels)
-        c = nn.functional.silu(t + y)
-
-        if s is None:
-            s = self.s_embedder(x)
-            s = self._apply_blocks(s, range(self.num_encoder_blocks), c, self.enc_feat_rope)
-            s = nn.functional.silu(t.unsqueeze(1) + s)
-
+    def forward(
+            self,
+            x,
+            timestep=None,
+            class_labels=None,
+            unpatchify_output=True,
+            fp32_final_layer=False):
         bs, _, h, w = x.size()
         height, width = h // self.x_patch_size, w // self.x_patch_size
 
-        s = self.s_projector(s)
+        t = self.t_embedder(timestep)
+        y = self.y_embedder(class_labels)
+        # Modulation layers already have SiLU, this is redundant, but we keep it for consistency
+        # with the original RAE implementation
+        c = F.silu(t + y)
+
+        s = self.s_embedder(x)
+        s = self._apply_blocks(s, range(self.num_encoder_blocks), c, self.enc_feat_rope)
+        s = self.s_projector(F.silu(t.unsqueeze(1) + s))
+
         x = self.x_embedder(x)
         x = self._apply_blocks(x, range(self.num_encoder_blocks, self.num_blocks), s, self.dec_feat_rope)
-        x = self.final_layer(x, s)
+        x = fp32_module_forward(self.final_layer, x, s, enabled=fp32_final_layer)
 
-        x = x.reshape(
-            bs, height, width, self.x_patch_size, self.x_patch_size, self.out_channels
-        ).permute(0, 5, 1, 3, 2, 4).reshape(
-            bs, self.out_channels, height * self.x_patch_size, width * self.x_patch_size)
+        if unpatchify_output:
+            x = x.reshape(
+                bs, height, width, self.x_patch_size, self.x_patch_size, self.out_channels
+            ).permute(0, 5, 1, 3, 2, 4).reshape(
+                bs, self.out_channels, h, w)
         return x
 
-    def forward(self, x, timestep=None, class_labels=None, s=None):
-        if self._compiled_forward is not None:
-            return self._compiled_forward(x, timestep=timestep, class_labels=class_labels, s=s)
-        return self._forward_impl(x, timestep=timestep, class_labels=class_labels, s=s)
+
+@MODULES.register_module()
+class LightningDDT(_LightningDDT):
+
+    def __init__(
+            self,
+            *args,
+            pretrained=None,
+            torch_dtype='float32',
+            compile_forward=False,
+            compile_kwargs=dict(
+                mode='reduce-overhead',
+                fullgraph=True,
+                dynamic=False),
+            autocast_dtype=None,
+            freeze=False,
+            freeze_exclude=[],
+            freeze_exclude_fp32=True,
+            freeze_exclude_autocast_dtype=None,
+            **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.init_weights(pretrained)
+
+        if autocast_dtype is not None:
+            assert torch_dtype == 'float32'
+        self.autocast_dtype = autocast_dtype
+
+        if torch_dtype is not None:
+            self.to(getattr(torch, torch_dtype))
+
+        self.freeze = freeze
+        if self.freeze:
+            flex_freeze(
+                self,
+                exclude_keys=freeze_exclude,
+                exclude_fp32=freeze_exclude_fp32,
+                exclude_autocast_dtype=freeze_exclude_autocast_dtype,
+            )
+
+        self._compiled_forward = None
+        if compile_forward:
+            self._compiled_forward = torch.compile(self._forward_impl, **compile_kwargs)
+
+    def init_weights(self, pretrained=None):
+        if pretrained is not None:
+            logger = get_root_logger()
+            state_dict = _load_cached_checkpoint(pretrained, map_location='cpu', logger=logger)
+            # Convert original state dict to match diffusers' PatchEmbed
+            if 'pos_embed' in state_dict and 's_embedder.pos_embed' not in state_dict:
+                state_dict['s_embedder.pos_embed'] = state_dict.pop('pos_embed')
+            load_full_state_dict(self, state_dict, logger=logger)
+
+        else:
+            super().init_weights()
+
+    def _forward_impl(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
+
+    def forward(self, x, timestep=None, class_labels=None, **kwargs):
+        if self.autocast_dtype is not None:
+            dtype = getattr(torch, self.autocast_dtype)
+        else:
+            dtype = x.dtype
+        with torch.autocast(
+                device_type='cuda',
+                enabled=self.autocast_dtype is not None,
+                dtype=dtype if self.autocast_dtype is not None else None):
+            if self._compiled_forward is not None:
+                return self._compiled_forward(x.to(dtype), timestep=timestep, class_labels=class_labels, **kwargs)
+            return self._forward_impl(x.to(dtype), timestep=timestep, class_labels=class_labels, **kwargs)

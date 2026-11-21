@@ -68,6 +68,7 @@ function adjustAlignment() {
    5.  Open / close / zoom
 ---------------------------------------------------------- */
 function show(i) {
+    if (media?.tagName === 'VIDEO') media.pause();
     idx = (i + sources.length) % sources.length;
 
     container.innerHTML = mediaTag(sources[idx]);
@@ -90,6 +91,7 @@ function show(i) {
 }
 
 function hide() {
+    if (media?.tagName === 'VIDEO') media.pause();
     overlay.style.display = 'none'; // make it invisible
     document.body.style.overflow = '';
     isZoomed = false;
@@ -207,6 +209,8 @@ if (pageSize && totalPages > 1) {
                 // Unload: remove src to abort pending loads
                 if (media.src) {
                     media.removeAttribute('src');
+                    // <video> ignores src removal until load() resets the element
+                    if (media.tagName === 'VIDEO') media.load();
                 }
             }
         });

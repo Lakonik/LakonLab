@@ -144,7 +144,7 @@ Before training, Download [ILSVRC2012_img_train.tar](https://www.image-net.org/c
 
 Run the following command to precompute the PCA subspace:
 ```bash
-python tools/asymflow_subspace_pca_dit.py configs/asymflow/asymflow_h_16_r8_imagenet_16gpus.py
+python tools/fitting/asymflow_subspace_pca_dit.py configs/asymflow/asymflow_h_16_r8_imagenet_8gpus.py
 ```
 
 Then, run the following command to train the model using DDP on 1 node with 8 GPUs:
@@ -176,13 +176,13 @@ torchrun --nnodes=1 --nproc_per_node=8 tools/test.py <PATH_TO_CONFIG> --ckpt <PA
 
 Run the following command to download the full dataset containing 3 million text-image pairs.
 ```bash
-python tools/download_laion3m_dataset.py
+python tools/datasets/download_laion3m_dataset.py
 ```
 By default, the data will be saved to `data/laion-3m`, which requires 4TB of storage space. You can use the `--out-dir` argument to save the data to a different location (AWS S3 URLs are supported), and then update the data paths in the [training config file](../configs/asymflow/asymflux2_klein_32gpus.py) accordingly. Use `--num-shards` to download only a subset of the dataset (e.g., `--num-shards 4` to download 4/300 of the dataset).
 
 Run the following command to precompute the Procrustes subspace:
 ```bash
-python tools/asymflow_subspace_procrustes.py configs/asymflow/asymflux2_klein_32gpus.py
+python tools/fitting/asymflow_subspace_procrustes.py configs/asymflow/asymflux2_klein_32gpus.py
 ```
 
 Run the following command to train the AsymFLUX.2 klein model using DDP on 4 nodes with 8 GPUs each:
@@ -210,7 +210,7 @@ To evaluate a custom checkpoint instead of the official model, we provide two op
 
 Run the export script to convert the checkpoint to diffusers safetensors:
 ```bash
-python tools/export_asymflow_to_diffusers.py <PATH_TO_CONFIG> --ckpt <PATH_TO_CKPT> --out-dir <OUTPUT_DIR>
+python tools/checkpoints/export_asymflow_to_diffusers.py <PATH_TO_CONFIG> --ckpt <PATH_TO_CKPT> --out-dir <OUTPUT_DIR>
 ```
 Then, modify the test config file to set `pretrained_adapter` to `<OUTPUT_DIR>/diffusion_pytorch_model.safetensors`. Finally, run the evaluation command as above.
 
@@ -224,8 +224,8 @@ torchrun --nnodes=1 --nproc_per_node=8 tools/test.py <PATH_TO_CONFIG> --ckpt <PA
 ## Essential Code
 
 - Subspace precomputation
-    - [asymflow_subspace_pca_dit.py](../tools/asymflow_subspace_pca_dit.py): Create a patch PCA subspace for AsymFlow models using DiT patch convention (channel last).
-    - [asymflow_subspace_procrustes.py](../tools/asymflow_subspace_procrustes.py): Create a Procrustes latent-to-pixel subspace for pixel AsymFlow finetuning.
+    - [asymflow_subspace_pca_dit.py](../tools/fitting/asymflow_subspace_pca_dit.py): Create a patch PCA subspace for AsymFlow models using DiT patch convention (channel last).
+    - [asymflow_subspace_procrustes.py](../tools/fitting/asymflow_subspace_procrustes.py): Create a Procrustes latent-to-pixel subspace for pixel AsymFlow finetuning.
 - Modeling
     - [asymjit.py](../lakonlab/models/architectures/asymflow/asymjit.py): AsymFlow wrapper for JiT architecture.
     - [asymflux2.py](../lakonlab/models/architectures/asymflow/asymflux2.py): AsymFlow wrapper and initialization utilities for FLUX.2 architecture.

@@ -299,8 +299,8 @@ class PiFlux2Pipeline(Flux2Pipeline, LakonLabMixin):
 
                 self._current_timestep = t_src
                 time_scaling = self.scheduler.config.num_train_timesteps
-                sigma_t_src = t_src / time_scaling
-                sigma_t_dst = t_dst / time_scaling
+                sigma_t_src = (t_src / time_scaling).expand(latents.shape[0], 1, 1, 1)
+                sigma_t_dst = (t_dst / time_scaling).expand(latents.shape[0], 1, 1, 1)
 
                 latent_model_input = latents.to(self.transformer.dtype)
                 latent_image_ids = latent_ids
@@ -319,13 +319,12 @@ class PiFlux2Pipeline(Flux2Pipeline, LakonLabMixin):
                     joint_attention_kwargs=self._attention_kwargs,
                 )
 
-                denoising_output = {
-                    k: v[:, :latents.size(1)].to(torch.float32) for k, v in denoising_output.items()}
-
                 # unpack and create policy
                 latents = self._unpack_latents_with_ids(latents, latent_ids)
                 latents = self._unpatchify_latents(latents)
                 if self.policy_type == 'GMFlow':
+                    denoising_output = {
+                        k: v[:, :image_seq_len].to(torch.float32) for k, v in denoising_output.items()}
                     denoising_output = self._unpack_gm(
                         denoising_output, height, width, num_channels_latents, gm_patch_size=1)
                     policy = self.policy_class(
@@ -337,7 +336,7 @@ class PiFlux2Pipeline(Flux2Pipeline, LakonLabMixin):
                             assert isinstance(temperature, (float, int))
                         policy.temperature_(temperature)
                 elif self.policy_type == 'DX':
-                    denoising_output = denoising_output[0]
+                    denoising_output = denoising_output[0][:, :image_seq_len].to(torch.float32)
                     denoising_output = self._unpack_latents_with_ids(denoising_output, latent_ids)
                     denoising_output = self._unpatchify_latents(denoising_output)
                     denoising_output = denoising_output.reshape(latents.size(0), -1, *latents.shape[1:])
@@ -354,7 +353,8 @@ class PiFlux2Pipeline(Flux2Pipeline, LakonLabMixin):
                     latents, sigma_t_src, raw_t_src, raw_t_dst, self.scheduler,
                     seq_len=image_seq_len, total_substeps=total_substeps)
 
-                latents = self.scheduler.step(latents_dst, t_src, latents, return_dict=False)[0]
+                latents = self.scheduler.step(
+                    latents_dst, t_src, latents, generator=generator, return_dict=False)[0]
 
                 # repack
                 latents = self._patchify_latents(latents)
@@ -379,7 +379,6 @@ class PiFlux2Pipeline(Flux2Pipeline, LakonLabMixin):
         if output_type == "latent":
             image = latents
         else:
-            torch.save({"pred": latents}, "pred_d.pt")
             latents = self._unpack_latents_with_ids(latents, latent_ids)
 
             latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)

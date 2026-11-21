@@ -342,8 +342,8 @@ class PiFluxPipeline(FluxPipeline, LakonLabMixin):
 
                 self._current_timestep = t_src
                 time_scaling = self.scheduler.config.num_train_timesteps
-                sigma_t_src = t_src / time_scaling
-                sigma_t_dst = t_dst / time_scaling
+                sigma_t_src = (t_src / time_scaling).expand(latents.shape[0], 1, 1, 1)
+                sigma_t_dst = (t_dst / time_scaling).expand(latents.shape[0], 1, 1, 1)
 
                 if image_embeds is not None:
                     self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
@@ -394,7 +394,8 @@ class PiFluxPipeline(FluxPipeline, LakonLabMixin):
                     latents, sigma_t_src, raw_t_src, raw_t_dst, self.scheduler,
                     seq_len=image_seq_len, total_substeps=total_substeps)
 
-                latents = self.scheduler.step(latents_dst, t_src, latents, return_dict=False)[0]
+                latents = self.scheduler.step(
+                    latents_dst, t_src, latents, generator=generator, return_dict=False)[0]
 
                 # repack
                 latents = self._pack_latents(

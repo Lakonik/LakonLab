@@ -5,7 +5,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 import gradio as gr
-from mmcv.runner import set_random_seed
+from lakonlab.runner.utils import set_random_seed
 from lakonlab.models.diffusions.schedulers.flow_map_sde import FlowMapSDEScheduler
 from lakonlab.ui.gradio.create_img_edit import create_interface_img_edit
 from lakonlab.pipelines.pipeline_piflux2 import PiFlux2Pipeline
@@ -92,8 +92,7 @@ def main():
         ).images[0]
 
     with gr.Blocks(analytics_enabled=False,
-                   title='pi-FLUX.2 Demo',
-                   css_paths='lakonlab/ui/gradio/style.css'
+                   title='pi-FLUX.2 Demo'
                    ) as demo:
 
         md_txt = '# pi-FLUX.2 Demo\n\n' \
@@ -112,7 +111,7 @@ def main():
             height=1024,
             width=1024
         )
-        demo.queue().launch(share=args.share)
+        demo.queue().launch(share=args.share, ssr_mode=False, css_paths='lakonlab/ui/gradio/style.css')
 
 
 if __name__ == "__main__":

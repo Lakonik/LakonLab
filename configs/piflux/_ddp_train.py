@@ -29,5 +29,4 @@ runner = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 module_wrapper = 'ddp'
-cudnn_benchmark = True
 mp_start_method = 'fork'

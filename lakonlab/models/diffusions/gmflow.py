@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Hansheng Chen
 
-import sys
 import inspect
+import tqdm
 from typing import Optional
 from copy import deepcopy
 
 import torch
 import diffusers
-import mmcv
+from diffusers.utils.torch_utils import randn_tensor
 
 from ..builder import MODULES, build_module
 from . import GaussianFlow, schedulers
@@ -440,25 +440,7 @@ class GMFlow(GMFlowMixin, GaussianFlow):
 
         return loss, log_vars
 
-    def forward_test(
-            self, x_0=None, noise=None, guidance_scale=0.0,
-            test_cfg_override=dict(), show_pbar=False, **kwargs):
-        x_t = torch.randn_like(x_0) if noise is None else noise
-        num_batches = x_t.size(0)
-        seq_len = x_t.shape[2:].numel()  # h * w or t * h * w
-        ori_dtype = x_t.dtype
-        x_t = x_t.float()
-        ndim = x_t.dim()
-        assert ndim in [4, 5], f'Invalid x_t shape: {x_t.shape}. Expected 4D or 5D tensor.'
-        if ndim == 5:  # (bs, c, t, h, w)
-            x_t = x_t.permute(0, 2, 1, 3, 4)  # (bs, t, c, h, w)
-
-        cfg = deepcopy(self.test_cfg)
-        cfg.update(test_cfg_override)
-
-        output_mode = cfg.get('output_mode', 'mean')
-        assert output_mode in ['mean', 'sample']
-
+    def _build_sampler(self, x_t, cfg):
         sampler = cfg['sampler']
         sampler_class = getattr(diffusers.schedulers, sampler + 'Scheduler', None)
         if sampler_class is None:
@@ -468,7 +450,8 @@ class GMFlow(GMFlowMixin, GaussianFlow):
 
         sampler_kwargs = cfg.get('sampler_kwargs', {})
         signatures = inspect.signature(sampler_class).parameters.keys()
-        for key in ['shift', 'use_dynamic_shifting', 'base_seq_len', 'max_seq_len', 'base_logshift', 'max_logshift']:
+        for key in ['shift', 'use_dynamic_shifting', 'dynamic_shifting_type',
+                    'base_seq_len', 'max_seq_len', 'base_logshift', 'max_logshift']:
             if key in signatures and key not in sampler_kwargs:
                 sampler_kwargs[key] = cfg.get(key, getattr(self.timestep_sampler, key))
         for key in ['max_raw_t', 'min_raw_t']:
@@ -478,19 +461,39 @@ class GMFlow(GMFlowMixin, GaussianFlow):
 
         num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
         num_substeps = cfg.get('num_substeps', 1)
+        if 'seq_len' in inspect.signature(sampler.set_timesteps).parameters:
+            seq_len = x_t.shape[2:].numel()  # h * w or t * h * w
+            sampler.set_timesteps(num_timesteps * num_substeps, seq_len=seq_len, device=x_t.device)
+        else:
+            sampler.set_timesteps(num_timesteps * num_substeps, device=x_t.device)
+
+        return sampler
+
+    def forward_test(
+            self, x_0=None, noise=None, guidance_scale=0.0,
+            test_cfg_override=dict(), show_pbar=False, generator=None, tqdm_cls=tqdm.tqdm, **kwargs):
+        x_t = randn_tensor(
+            x_0.shape, dtype=x_0.dtype, device=x_0.device, generator=generator) if noise is None else noise
+        num_batches = x_t.size(0)
+        ori_dtype = x_t.dtype
+        x_t = x_t.float()
+        ndim = x_t.dim()
+        assert ndim in [4, 5], f'Invalid x_t shape: {x_t.shape}. Expected 4D or 5D tensor.'
+        cfg = deepcopy(self.test_cfg)
+        cfg.update(deepcopy(test_cfg_override))
+
+        output_mode = cfg.get('output_mode', 'mean')
+        assert output_mode in ['mean', 'sample']
         guidance_interval = cfg.get('guidance_interval', [0, self.num_timesteps])
         orthogonal_guidance = cfg.get('orthogonal_guidance', 1.0)
         save_intermediate = cfg.get('save_intermediate', False)
         order = cfg.get('order', 1)
         gm2_coefs = cfg.get('gm2_coefs', [0.005, 1.0])
         gm2_correction_steps = cfg.get('gm2_correction_steps', 0)
+        num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
+        num_substeps = cfg.get('num_substeps', 1)
 
-        set_timesteps_signatures = inspect.signature(sampler.set_timesteps).parameters.keys()
-        if 'seq_len' in set_timesteps_signatures:
-            sampler.set_timesteps(num_timesteps * num_substeps, seq_len=seq_len, device=x_t.device)
-        else:
-            sampler.set_timesteps(num_timesteps * num_substeps, device=x_t.device)
-
+        sampler = self._build_sampler(x_t, cfg)
         timesteps = sampler.timesteps
         self.intermediate_x_t = []
         self.intermediate_x_0 = []
@@ -504,10 +507,10 @@ class GMFlow(GMFlowMixin, GaussianFlow):
                 [guidance_scale]
             ).expand(num_batches).reshape([num_batches] + [1] * (x_t.dim() - 1))
 
-        x_t = timesteps[0] / self.num_timesteps * x_t
+        if ndim == 5:  # (bs, c, t, h, w)
+            x_t = x_t.permute(0, 2, 1, 3, 4)  # (bs, t, c, h, w)
 
-        if show_pbar:
-            pbar = mmcv.ProgressBar(num_timesteps)
+        pbar = tqdm_cls(None, total=len(timesteps)) if show_pbar else tqdm.tqdm(disable=True)
 
         # ========== Main sampling loop ==========
         self.init_gm_cache()
@@ -560,7 +563,8 @@ class GMFlow(GMFlowMixin, GaussianFlow):
                     h = t
                 gm_output, gaussian_output = self.gm_2nd_order(
                     gm_output, gaussian_output, x_t, t, h,
-                    guidance_scale if guidance_active else 0.0, gm_cond, gaussian_cond, avg_var, cfg_bias,
+                    guidance_scale if use_guidance and guidance_active else 0.0,
+                    gm_cond, gaussian_cond, avg_var, cfg_bias,
                     ca=gm2_coefs[0], cb=gm2_coefs[1], gm2_correction_steps=gm2_correction_steps)
 
             if save_intermediate:
@@ -588,23 +592,20 @@ class GMFlow(GMFlowMixin, GaussianFlow):
                     t = timesteps[timestep_id * num_substeps + substep_id]
                     model_output = self.gmflow_posterior_mean(
                         gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
-                x_t = sampler.step(model_output, t, x_t, return_dict=False, prediction_type='x0')[0]
+                x_t = sampler.step(model_output, t, x_t, generator=generator, return_dict=False, prediction_type='x0')[0]
 
             if save_intermediate:
                 self.intermediate_x_0.append(model_output)
 
-            if show_pbar:
-                pbar.update()
-
-        if show_pbar:
-            sys.stdout.write('\n')
+            pbar.update()
 
         if ndim == 5:  # (bs, t, c, h, w)
             x_t = x_t.permute(0, 2, 1, 3, 4)  # (bs, c, t, h, w)
 
         return x_t.to(ori_dtype)
 
-    def forward_u(self, x_t, t, guidance_scale=0.0, test_cfg=dict(), **kwargs):
+    def forward_u(
+            self, x_t, t, guidance_scale=0.0, test_cfg=dict(), sample_callback=None, **kwargs):
         ori_dtype = x_t.dtype
         x_t = x_t.float()
         num_batches = x_t.size(0)
@@ -656,5 +657,11 @@ class GMFlow(GMFlowMixin, GaussianFlow):
 
         if ndim == 5:  # (bs, t, c, h, w)
             u = u.permute(0, 2, 1, 3, 4)  # (bs, c, t, h, w)
+            x_t = x_t.permute(0, 2, 1, 3, 4)  # (bs, c, t, h, w)
+
+        if sample_callback is not None:
+            callback_outputs = sample_callback(
+                self, dict(x_t=x_t, u=u, t=t))
+            u = callback_outputs.get('u', u)
 
         return u.to(ori_dtype)

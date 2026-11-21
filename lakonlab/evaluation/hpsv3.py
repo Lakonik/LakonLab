@@ -24,7 +24,7 @@ from mmcv.runner import get_dist_info
 from lakonlab.runner.checkpoint import _load_checkpoint
 from lakonlab.utils.io_utils import hf_model_loader
 from .builder import METRICS
-from .metrics import Metric
+from .metrics import Metric, VideoAdapterMixin
 
 
 INSTRUCTION = """
@@ -259,6 +259,7 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
+        **kwargs,  # transformers >= 5 processors emit extra keys (e.g. mm_token_type_ids)
     ):
         # modified from the origin class Qwen2VLForConditionalGeneration
         output_attentions = (
@@ -280,6 +281,8 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.model.visual.get_dtype())
                 image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
+                if not torch.is_tensor(image_embeds):
+                    image_embeds = image_embeds.pooler_output  # transformers >= 5 puts the merged states here
                 image_mask = (
                     (input_ids == self.config.image_token_id)
                     .unsqueeze(-1)
@@ -293,6 +296,8 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.model.visual.get_dtype())
                 video_embeds = self.model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                if not torch.is_tensor(video_embeds):
+                    video_embeds = video_embeds.pooler_output  # transformers >= 5 puts the merged states here
                 video_mask = (
                     (input_ids == self.config.video_token_id)
                     .unsqueeze(-1)
@@ -461,14 +466,17 @@ def load_hpsv3(device, dtype, use_fsdp=True):
 
 
 @METRICS.register_module()
-class HPSv3(Metric):
+class HPSv3(VideoAdapterMixin, Metric):
     name = 'HPSv3'
     requires_prompt = True
 
     def __init__(self,
                  num_images=None,
-                 use_fsdp=True):
+                 use_fsdp=True,
+                 video_fps=16.0,
+                 sample_fps=1.0):
         super().__init__(num_images)
+        self.setup_video_adapter(video_fps, sample_fps)
         use_fsdp = use_fsdp and torch.cuda.is_available() and dist.is_initialized() and dist.get_world_size() > 0
 
         self.use_fsdp = use_fsdp
@@ -481,12 +489,8 @@ class HPSv3(Metric):
     def prepare(self):
         self.scores = []
 
-    @torch.no_grad()
-    def feed_op(self, batch, mode):
-        imgs = batch['imgs']
-        prompts = batch['prompts']
-
-        imgs = (imgs.to(device=self.device, dtype=torch.float32) / 2 + 0.5).clamp(0, 1)
+    def _score_images(self, imgs, prompts):
+        imgs = imgs.to(device=self.device, dtype=torch.float32).clamp(0, 1)
 
         message_list = []
         for text in prompts:
@@ -522,6 +526,15 @@ class HPSv3(Metric):
             return_dict=True,
             **batch
         )["logits"][:, 0]
+        # a column of the logits is strided, which `all_gather` rejects for a batch above one
+        return rewards.contiguous()
+
+    @torch.no_grad()
+    def feed_op(self, batch, mode):
+        imgs, prompts, video_shape = self._flatten_video_frames(
+            batch['imgs'], batch['prompts'])
+        rewards = self._score_images(imgs, prompts)
+        rewards = self._reduce_video_frame_scores(rewards, video_shape)
 
         if dist.is_initialized():
             ws = dist.get_world_size()

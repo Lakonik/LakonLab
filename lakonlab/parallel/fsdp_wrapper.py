@@ -3,11 +3,15 @@
 from collections import abc
 from typing import Any
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, FullyShardedDataParallel
 from torch.distributed.fsdp.wrap import CustomPolicy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing, checkpoint_wrapper
+from torch.utils.checkpoint import checkpoint
 from torch.distributed.utils import _p_assert
 from torch.distributed.fsdp._runtime_utils import (
     _pre_forward,
@@ -20,10 +24,20 @@ from mmcv.parallel.scatter_gather import scatter_kwargs
 from mmcv.parallel import MODULE_WRAPPERS
 
 from lakonlab.utils import get_module_object
+from .ddp_wrapper import MMDistributedDataParallelFix
 
 
 MODULE_WRAPPERS.register_module(
     name='FSDP', module=FullyShardedDataParallel)
+
+
+def _reduce_param_grad(param):
+    # DDP-style replication for trainable no-shard params: FSDP skips gradient reduction
+    # for ignored states, so average the gradient over all ranks manually (fires after
+    # each grad accumulation; already-averaged partial sums are fixed points, so this is
+    # correct under gradient accumulation)
+    if param.grad is not None:
+        dist.all_reduce(param.grad.div_(dist.get_world_size()), op=dist.ReduceOp.SUM)
 
 
 def _clone_if_reqgrad(x, memo):
@@ -80,6 +94,34 @@ def clone_grad_inputs(*args, **kwargs):
     return new_args, new_kwargs
 
 
+def _hide_sharded_grads(root):
+    """Detach the fp32 sharded grads from the flat params for the duration of a forward.
+
+    FSDP1 swaps ``flat_param.data`` to the bf16 unsharded buffer while a sharded fp32
+    ``.grad`` may still be attached (e.g. between two backward passes). Dynamo mirrors
+    ``.grad`` when it fakifies a param view's base and torch rejects the dtype mismatch,
+    so compiling a new frame after a backward fails. Call before unsharding (flat params
+    sharded) and restore with ``_restore_sharded_grads`` after the post-forward reshard.
+    """
+    hidden_grads = []
+    # Nested FSDP units have one handle; only the root has _all_handles.
+    for h in root._all_handles if root._is_root else (root._handle,):
+        grad = h.flat_param.grad
+        if grad is None or grad.shape != h.flat_param.shape or h._skipped_use_sharded_views:
+            continue  # no grad, unsharded no_sync grad, or no-reshard-after-forward strategy
+        hidden_grads.append((h, grad))
+        h.flat_param.grad = None
+        for p in h.flat_param._params or ():  # else pre-unshard writes them back into the flat param
+            p.grad = None
+    return hidden_grads
+
+
+def _restore_sharded_grads(hidden_grads):
+    for h, grad in hidden_grads:
+        h.flat_param.grad = grad
+        h._use_sharded_grad_views()
+
+
 class FullyShardedDataParallelFix(FullyShardedDataParallel):
 
     def _forward_with_fsdp(self, record_name, forward_impl, *args: Any, **kwargs: Any) -> Any:
@@ -89,6 +131,7 @@ class FullyShardedDataParallelFix(FullyShardedDataParallel):
         ):
             args, kwargs = _root_pre_forward(self, self, args, kwargs)
             unused = None
+            hidden_grads = _hide_sharded_grads(self)
             # =================================================
             # clone the input tensors that require grad if the module is frozen
             flat_param = handle.flat_param
@@ -111,9 +154,11 @@ class FullyShardedDataParallelFix(FullyShardedDataParallel):
                     f"{self.compute_device} but got {handle.flat_param.device}",
                 )
             output = forward_impl(*args, **kwargs)
-            return _post_forward(
+            output = _post_forward(
                 self, handle, _post_forward_reshard, self, unused, output
             )
+            _restore_sharded_grads(hidden_grads)
+            return output
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self._forward_with_fsdp(
@@ -131,8 +176,32 @@ class FullyShardedDataParallelFix(FullyShardedDataParallel):
         setattr(self, method_name, forward_method)
 
 
+def offloaded_checkpoint(fn, hidden_states, *args, **kwargs):
+    """Non-reentrant checkpoint that keeps the saved block input in pinned host memory until recomputation.
+
+    The checkpoint saves its inputs for backward before entering its own hooks, so these hooks see only the inputs.
+    Only the first one (the block's hidden states) is offloaded; inputs shared by all blocks stay on the device.
+    """
+    # autograd keeps the hooks alive until backward, so they must not reference the tensor they offload
+    hidden_states_id = id(hidden_states)
+
+    def pack(tensor):
+        if id(tensor) != hidden_states_id:
+            return tensor
+        packed = torch.empty(tensor.size(), dtype=tensor.dtype, pin_memory=True)
+        packed.copy_(tensor, non_blocking=True)
+        return tensor.device, packed
+
+    def unpack(packed):
+        return packed[1].to(packed[0], non_blocking=True) if isinstance(packed, tuple) else packed
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        return checkpoint(fn, hidden_states, *args, use_reentrant=False, **kwargs)
+
+
 def tie_fsdp_modules(tgt_module, src_module, recursive=True):
-    if isinstance(src_module, FullyShardedDataParallel) and isinstance(tgt_module, FullyShardedDataParallel):
+    # Fully tied frozen targets may own no parameters and have no FSDP wrapper.
+    if isinstance(src_module, FullyShardedDataParallel):
 
         old_forward = tgt_module.forward
 
@@ -140,6 +209,7 @@ def tie_fsdp_modules(tgt_module, src_module, recursive=True):
             handle = src_module._handle
             args, kwargs = _root_pre_forward(src_module, src_module, args, kwargs)
             unused = None
+            hidden_grads = _hide_sharded_grads(src_module)
             # =================================================
             # clone the input tensors that require grad if the module is frozen
             flat_param = handle.flat_param
@@ -162,21 +232,27 @@ def tie_fsdp_modules(tgt_module, src_module, recursive=True):
                     f"{src_module.compute_device} but got {handle.flat_param.device}",
                 )
             output = old_forward(*args, **kwargs)
-            return _post_forward(
+            output = _post_forward(
                 src_module, handle, _post_forward_reshard, src_module, unused, output
             )
+            _restore_sharded_grads(hidden_grads)
+            return output
 
         tgt_module.forward = new_forward
 
     if recursive:
-        for key, val in src_module._modules.items():
+        if isinstance(src_module, FullyShardedDataParallel) and not isinstance(tgt_module, FullyShardedDataParallel):
+            src_children = src_module._fsdp_wrapped_module._modules
+        else:
+            src_children = src_module._modules
+        for key, val in src_children.items():
             if key in tgt_module._modules:
                 tie_fsdp_modules(tgt_module._modules[key], val, recursive)
 
 
 @MODULE_WRAPPERS.register_module()
 class FSDPWrapper(nn.Module):
-    
+
     def __init__(
             self,
             module,
@@ -188,9 +264,16 @@ class FSDPWrapper(nn.Module):
             buffer_dtype='float32',
             fsdp_modules=None,
             exclude_keys=(),
+            offload_keys=(),
+            ddp_keys=(),
+            ddp_kwargs=dict(),
             tie_key_mappings=None,
             use_orig_params=True,
             hybrid_sharding=True,
+            activation_checkpointing=False,
+            activation_offloading=False,
+            compile_forward=False,
+            compile_kwargs=dict(mode='default', fullgraph=True, dynamic=False),
             **kwargs):
         super().__init__()
         self.module = module
@@ -226,15 +309,29 @@ class FSDPWrapper(nn.Module):
             ignore_frozen_parameters,
             exclude_keys,
             tie_key_mappings,
+            offload_keys=offload_keys,
+            ddp_keys=ddp_keys,
+            ddp_kwargs=ddp_kwargs,
             fsdp_modules=fsdp_modules,
+            activation_checkpointing=activation_checkpointing,
+            activation_offloading=activation_offloading,
+            compile_forward=compile_forward,
+            compile_kwargs=compile_kwargs,
             **fsdp_kwargs)
 
     def to_fsdp(
             self, device_id, wrap_frozen_modules=False, ignore_frozen_parameters=False,
-            exclude_keys=(), tie_key_mappings=None, fsdp_modules=(), **kwargs):
+            exclude_keys=(), tie_key_mappings=None, offload_keys=(), ddp_keys=(), ddp_kwargs=dict(),
+            fsdp_modules=(), activation_checkpointing=False, activation_offloading=False,
+            compile_forward=False, compile_kwargs=dict(mode='default', fullgraph=True, dynamic=False), **kwargs):
         for name, module in self.module._modules.items():
-            if name in exclude_keys or next(module.parameters(), None) is None:
-                module = module.cuda()
+            if name in ddp_keys:
+                module = MMDistributedDataParallelFix(
+                    module.cuda(), device_ids=[device_id], broadcast_buffers=True, **ddp_kwargs)
+                module.broadcast_buffers = False  # https://github.com/pytorch/pytorch/issues/177514
+            elif name in exclude_keys or next(module.parameters(), None) is None:
+                # excluded modules in offload_keys stay on CPU; their @onload methods move them in
+                module = module if name in offload_keys else module.cuda()
             elif all(not p.requires_grad for p in module.parameters()):
                 if wrap_frozen_modules:
                     fsdp_kwargs = kwargs.copy()
@@ -244,7 +341,7 @@ class FSDPWrapper(nn.Module):
                             p.data = p.data.cuda()
                             ignored_states.append(p)
                     fsdp_kwargs.update(
-                        use_orig_params=False,
+                        use_orig_params=kwargs['use_orig_params'] if compile_forward else False,
                         ignored_states=ignored_states,
                         auto_wrap_policy=CustomPolicy(
                             lambda m: isinstance(m, fsdp_modules) and next(m.parameters(), None) is not None))
@@ -261,6 +358,8 @@ class FSDPWrapper(nn.Module):
                     if getattr(p, 'lakonlab_no_shard', False) or (ignore_frozen_parameters and not p.requires_grad):
                         p.data = p.data.cuda()
                         ignored_states.append(p)
+                        if p.requires_grad:  # trainable params with lakonlab_no_shard
+                            p.register_post_accumulate_grad_hook(_reduce_param_grad)
                 fsdp_kwargs.update(
                     ignored_states=ignored_states,
                     auto_wrap_policy=CustomPolicy(
@@ -270,6 +369,20 @@ class FSDPWrapper(nn.Module):
                     device_id=device_id,
                     **fsdp_kwargs)
             self.module._modules[name] = module
+
+            if compile_forward and name not in exclude_keys and name not in ddp_keys:
+                # Compile block computation, keeping FSDP's pre/post-forward outside the graph.
+                for submodule in module.modules():
+                    if isinstance(submodule, fsdp_modules):
+                        submodule.forward = torch.compile(submodule.forward, **compile_kwargs)
+
+            if activation_checkpointing and name not in exclude_keys and name not in ddp_keys:
+                # Wrap inside FSDP, before tying, so checkpointing excludes FSDP bookkeeping.
+                apply_activation_checkpointing(
+                    module,
+                    checkpoint_wrapper_fn=partial(checkpoint_wrapper, checkpoint_fn=offloaded_checkpoint)
+                    if activation_offloading else checkpoint_wrapper,
+                    check_fn=lambda m: isinstance(m, fsdp_modules))
 
         if tie_key_mappings is not None:
             # parse tie_key_mappings in the format ('teacher->diffusion', 'teacher->diffusion_ema')

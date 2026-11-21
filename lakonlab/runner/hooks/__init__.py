@@ -1,5 +1,9 @@
+from .save_stats import SaveStatsHook
 from .ema_hook import ExponentialMovingAverageHook
 from .checkpoint import CheckpointHook
+from .lr_updater import FlatLinearAnnealingLrUpdaterHook
 from .logger import *
+from .model_updater import ModelUpdaterHook
 
-__all__ = ['CheckpointHook', 'ExponentialMovingAverageHook']
+__all__ = ['SaveStatsHook', 'CheckpointHook', 'ExponentialMovingAverageHook',
+           'ModelUpdaterHook', 'FlatLinearAnnealingLrUpdaterHook']

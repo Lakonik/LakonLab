@@ -20,7 +20,8 @@ class ContinuousTimeStepSampler:
             base_seq_len=256,
             max_seq_len=4096,
             base_logshift=0.5,
-            max_logshift=1.15):
+            max_logshift=1.15,
+            raw_t_bleed=(0.0, 0.0)):
         self.num_timesteps = num_timesteps
         self.shift = shift
         self.logit_normal_enable = logit_normal_enable
@@ -32,6 +33,7 @@ class ContinuousTimeStepSampler:
         self.max_seq_len = max_seq_len
         self.base_logshift = base_logshift
         self.max_logshift = max_logshift
+        self.raw_t_bleed = raw_t_bleed
 
     def get_shift(self, seq_len=None):
         if self.use_dynamic_shifting and seq_len is not None:
@@ -66,20 +68,26 @@ class ContinuousTimeStepSampler:
 
     def sample(self, batch_size, warp_t=True, scale_t=True, seq_len=None,
                raw_t_range=None, device=None):
+        raw_t_min, raw_t_max = raw_t_range or (0.0, 1.0)
+
         if self.logit_normal_enable:
-            if raw_t_range is not None:
-                assert raw_t_range[0] == 0.0 and raw_t_range[1] == 1.0
+            if raw_t_min != 0.0 or raw_t_max != 1.0:
+                raise NotImplementedError('Custom raw_t_range is not yet supported for logit-normal sampling.')
             t = torch.sigmoid(
                 self.logit_normal_mean + self.logit_normal_std * torch.randn(
                     (batch_size, ), dtype=torch.float, device=device))
         else:
-            if raw_t_range is not None:
-                assert isinstance(raw_t_range, (tuple, list)) and len(raw_t_range) == 2
-                t = torch.rand(
-                    (batch_size, ), dtype=torch.float, device=device
-                ) * (raw_t_range[0] - raw_t_range[1]) + raw_t_range[1]
-            else:
-                t = 1 - torch.rand((batch_size, ), dtype=torch.float, device=device)
+            t = torch.rand(
+                (batch_size, ), dtype=torch.float, device=device
+            ) * (raw_t_min - raw_t_max) + raw_t_max
+
+        if any(self.raw_t_bleed):
+            bleed_min, bleed_max = self.raw_t_bleed
+            t = (t - raw_t_min) * (
+                1 + (bleed_min + bleed_max) / (raw_t_max - raw_t_min)
+            ) + raw_t_min - bleed_min
+            t = t.clamp(raw_t_min, raw_t_max)
+
         if warp_t:
             t = self.warp_t(t, seq_len=seq_len)
         if scale_t:

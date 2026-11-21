@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib
 from collections.abc import Mapping, Sequence
+from itertools import repeat
 from typing import Any, Optional
 from functools import partial
 
@@ -12,13 +13,8 @@ import torch
 import torch.distributed as dist
 
 from torch.distributed.tensor import DTensor
-try:
-    from torch.distributed.fsdp import FSDPModule
-except:
-    FSDPModule = None
 
 from mmcv.parallel import is_module_wrapper
-from peft.tuners.lora import LoraLayer
 
 
 def multi_apply(func, *args, **kwargs):
@@ -81,6 +77,16 @@ def rdelattr(obj, attr):
 
 
 class module_requires_grad:
+    """Set ``requires_grad`` on a module's parameters, restoring it on exit.
+
+    ``requires_grad`` is either a single value for all parameters or a
+    per-parameter sequence in ``module.parameters()`` order, e.g. a state
+    captured from an earlier forward pass.
+
+    Restores both the original and currently exposed parameter objects when
+    a wrapper such as FSDP2 swaps them during the context.
+    """
+
     def __init__(self, module, requires_grad=True):
         self.module = module
         self.requires_grad = requires_grad
@@ -88,13 +94,18 @@ class module_requires_grad:
 
     def __enter__(self):
         self.prev = []
-        for p in self.module.parameters():
-            self.prev.append(p.requires_grad)
-            p.requires_grad = self.requires_grad
+        if isinstance(self.requires_grad, bool):
+            requires_grad = repeat(self.requires_grad)
+        else:
+            requires_grad = self.requires_grad
+        for p, r in zip(self.module.parameters(), requires_grad):
+            self.prev.append((p, p.requires_grad))
+            p.requires_grad = r
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        for p, r in zip(self.module.parameters(), self.prev):
+        for p, (prev_p, r) in zip(self.module.parameters(), self.prev):
+            prev_p.requires_grad = r
             p.requires_grad = r
 
 
@@ -120,26 +131,41 @@ def all_frozen(modules):
     return True
 
 
+def all_shapes_equal(tgt_module, src_module):
+    tgt_tensors = dict(tgt_module.named_parameters())
+    tgt_tensors.update(tgt_module.named_buffers())
+    src_tensors = dict(src_module.named_parameters())
+    src_tensors.update(src_module.named_buffers())
+    if tgt_tensors.keys() != src_tensors.keys():
+        return False
+    return all(tgt_tensors[k].shape == src_tensors[k].shape for k in tgt_tensors)
+
+
 def tie_untrained_root_params(tgt_module, src_module):
     for key, val in src_module._parameters.items():
         tgt_param = tgt_module._parameters.get(key, None)
         if (val is not None) \
                 and (tgt_param is not None) \
                 and (not val.requires_grad) \
-                and (not tgt_param.requires_grad):
+                and (not tgt_param.requires_grad) \
+                and tgt_param.shape == val.shape:
             val.lakonlab_no_shard = True  # hint for FSDP to not shard this parameter
             tgt_module._parameters[key] = val
 
 
 def tie_untrained_submodules(tgt_module, src_module, tie_tgt_lora_base_layer=False):
+    from peft.tuners.lora import LoraLayer  # peft imports bitsandbytes, which initializes CUDA
+    # A protected descendant also prevents sharing its entire parent container.
     for key, src_submodule in src_module._modules.items():
         if key in tgt_module._modules:
             if (tie_tgt_lora_base_layer
                     and isinstance(tgt_module._modules[key], LoraLayer)
                     and not isinstance(src_submodule, LoraLayer)):
-                if all_frozen((tgt_module._modules[key]._modules['base_layer'], src_submodule)) and not (
-                        getattr(tgt_module._modules[key]._modules['base_layer'], 'lakonlab_no_tie', False)
-                        or getattr(src_submodule, 'lakonlab_no_tie', False)):
+                if all_frozen((tgt_module._modules[key]._modules['base_layer'], src_submodule)) and not any(
+                        getattr(m, 'lakonlab_no_tie', False)
+                        for module in (tgt_module._modules[key]._modules['base_layer'], src_submodule)
+                        for m in module.modules()) \
+                        and all_shapes_equal(tgt_module._modules[key]._modules['base_layer'], src_submodule):
                     tgt_module._modules[key]._modules['base_layer'] = src_submodule
                 else:
                     tie_untrained_submodules(
@@ -147,9 +173,11 @@ def tie_untrained_submodules(tgt_module, src_module, tie_tgt_lora_base_layer=Fal
                     tie_untrained_root_params(
                         tgt_module._modules[key]._modules['base_layer'], src_submodule)
             else:
-                if all_frozen((tgt_module._modules[key], src_submodule)) and not (
-                        getattr(tgt_module._modules[key], 'lakonlab_no_tie', False)
-                        or getattr(src_submodule, 'lakonlab_no_tie', False)):
+                if all_frozen((tgt_module._modules[key], src_submodule)) and not any(
+                        getattr(m, 'lakonlab_no_tie', False)
+                        for module in (tgt_module._modules[key], src_submodule)
+                        for m in module.modules()) \
+                        and all_shapes_equal(tgt_module._modules[key], src_submodule):
                     tgt_module._modules[key] = src_submodule
                 else:
                     tie_untrained_submodules(
@@ -168,10 +196,20 @@ def _shares_storage(a, b):
     return a.data_ptr() == b.data_ptr()
 
 
-def untie_all_parameters(tgt_module, src_module, recursive=True, untie_tgt_lora_base_layer=False):
+def untie_all_parameters(
+        tgt_module, src_module, recursive=True, untie_tgt_lora_base_layer=False,
+        preserve_tied=False):
+    """Separate aliased storage, optionally preserving shared modules and parameter objects.
+
+    Buffers in independent modules are untied even when they are the same tensor object.
+    """
+    from peft.tuners.lora import LoraLayer  # peft imports bitsandbytes, which initializes CUDA
+    if preserve_tied and tgt_module is src_module:
+        return
     for key, val in src_module._parameters.items():
         if val is not None \
                 and tgt_module._parameters.get(key, None) is not None \
+                and not (preserve_tied and tgt_module._parameters[key] is val) \
                 and _shares_storage(tgt_module._parameters[key], val):
             tgt_param = tgt_module._parameters[key]
             tgt_module._parameters[key] = torch.nn.Parameter(
@@ -189,11 +227,13 @@ def untie_all_parameters(tgt_module, src_module, recursive=True, untie_tgt_lora_
                         and not isinstance(val, LoraLayer):
                     untie_all_parameters(
                         tgt_module._modules[key]._modules['base_layer'], val,
-                        recursive=True, untie_tgt_lora_base_layer=untie_tgt_lora_base_layer)
+                        recursive=True, untie_tgt_lora_base_layer=untie_tgt_lora_base_layer,
+                        preserve_tied=preserve_tied)
                 else:
                     untie_all_parameters(
                         tgt_module._modules[key], val,
-                        recursive=True, untie_tgt_lora_base_layer=untie_tgt_lora_base_layer)
+                        recursive=True, untie_tgt_lora_base_layer=untie_tgt_lora_base_layer,
+                        preserve_tied=preserve_tied)
 
 
 def clone_params(tgt_module, src_module, recursive=True):
@@ -201,13 +241,14 @@ def clone_params(tgt_module, src_module, recursive=True):
     Tied parameters/buffers are not cloned. Used for EMA model initialization.
     """
     for key, val in src_module._parameters.items():
-        if (val is not None) \
-                and (val is not tgt_module._parameters[key]):
+        tgt_param = tgt_module._parameters[key]
+        if (val is not None) and (val is not tgt_param):
             tgt_module._parameters[key] = torch.nn.Parameter(
-                val.detach().clone(), requires_grad=val.requires_grad)
+                val.detach().to(dtype=tgt_param.dtype, copy=True), requires_grad=tgt_param.requires_grad)
     for key, val in src_module._buffers.items():
-        if val is not tgt_module._buffers[key]:
-            tgt_module._buffers[key] = val.clone()
+        tgt_buffer = tgt_module._buffers[key]
+        if val is not tgt_buffer:
+            tgt_module._buffers[key] = val.to(dtype=tgt_buffer.dtype, copy=True)
     if recursive:
         for key, val in src_module._modules.items():
             clone_params(
@@ -215,60 +256,83 @@ def clone_params(tgt_module, src_module, recursive=True):
 
 
 @torch.no_grad()
-def kai_zhang_clip_grad(model, max_norm: float) -> torch.Tensor:
-    """
-    https://github.com/Kai-46/minFM/blob/385568691b021aa4888269dafa671900daf17cf6/utils/clip_grad.py#L9
-    """
-    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    shard_size, replicate_factor = 1, world_size
-    if FSDPModule is not None and isinstance(model, FSDPModule):
-        shard_size = model._get_fsdp_state()._fsdp_param_group.mesh_info.shard_mesh_size
-        replicate_factor = world_size // shard_size
+def fsdp2_clip_grad(model, max_norm: float) -> torch.Tensor:
+    """Clip the global L2 norm of FSDP2 DTensor gradients.
 
-    # Separate DTensor and non-DTensor parameters
-    all_param_grads = []
-    dtensor_param_grads = []
-    regular_param_grads = []
+    All trainable parameters must be DTensors whose meshes span the default
+    process group. Gradient placements may be replicated or sharded, but not
+    partial. All ranks must call this function collectively with the same
+    parameter set.
+
+    Returns a plain, fully reduced FP32 tensor that is identical on every rank.
+    Performs no host-device synchronization; clipping uses an on-device clamped
+    coefficient like ``torch.nn.utils.clip_grad_norm_``.
+    """
+    world_size = dist.get_world_size()
+    local_param_grads = []
+    replica_counts = []
 
     for p in model.parameters():
-        if (not p.requires_grad) or (p.grad is None):
+        if not p.requires_grad:
             continue
+        if not isinstance(p, DTensor):
+            raise RuntimeError(
+                'fsdp2_clip_grad found a trainable non-DTensor parameter '
+                'inside an FSDP2 module; FSDP2 does not synchronize gradients '
+                'for ignored parameters')
+        if p.grad is None:
+            continue
+        if not isinstance(p.grad, DTensor):
+            raise RuntimeError(
+                'fsdp2_clip_grad requires every trainable DTensor '
+                'parameter to have a DTensor gradient')
 
-        if isinstance(p.grad.data, DTensor):
-            local_p_grad = p.grad.data.to_local()
-            dtensor_param_grads.append(local_p_grad.ravel())
-        else:
-            local_p_grad = p.grad.data
-            regular_param_grads.append(local_p_grad.ravel())
+        grad = p.grad
+        mesh_size = grad.device_mesh.size()
+        if mesh_size != world_size:
+            raise RuntimeError(
+                'fsdp2_clip_grad requires every DTensor mesh to span the '
+                f'default process group, but got mesh size {mesh_size} and '
+                f'world size {world_size}')
 
-        all_param_grads.append(local_p_grad)
+        replica_count = mesh_size
+        for mesh_dim_size, placement in zip(grad.device_mesh.shape, grad.placements):
+            if placement.is_partial():
+                raise RuntimeError(
+                    'fsdp2_clip_grad does not support Partial gradient placements')
+            if placement.is_shard():
+                replica_count //= mesh_dim_size
+            elif not placement.is_replicate():
+                # catches e.g. _StridedShard (FSDP2 + TP), whose is_shard() is
+                # False on torch 2.10 and which would otherwise be silently
+                # miscounted as replication
+                raise RuntimeError(
+                    'fsdp2_clip_grad only supports replicated or sharded '
+                    f'gradient placements, but got {placement}')
 
-    if not all_param_grads:
-        return torch.tensor(0.0)
+        local_param_grads.append(grad.to_local())
+        replica_counts.append(replica_count)
 
-    # Compute local square sum for each group separately
-    local_sq_sum = torch.tensor(0.0, device=all_param_grads[0].device)
+    if not local_param_grads:
+        # grad presence is rank-uniform under FSDP2 (a rank-divergent backward
+        # would have hung its own reduce-scatter before reaching this point),
+        # so returning early without the all-reduce is collective-safe
+        return torch.zeros((), dtype=torch.float32)
 
-    if dtensor_param_grads:
-        dtensor_sq_sum = (torch.cat(dtensor_param_grads, dim=0) ** 2).float().sum()
-        local_sq_sum = local_sq_sum + dtensor_sq_sum
+    local_norms = torch.stack(torch._foreach_norm(local_param_grads, 2.0)).float()
+    replica_counts_tensor = torch.tensor(
+        replica_counts, dtype=torch.float32, device=local_param_grads[0].device)
+    local_sq_sum = (local_norms.square() / replica_counts_tensor).sum()
 
-    if regular_param_grads:
-        regular_sq_sum = (torch.cat(regular_param_grads, dim=0) ** 2).float().sum()
-        local_sq_sum = local_sq_sum + regular_sq_sum / shard_size
+    dist.all_reduce(local_sq_sum, op=dist.ReduceOp.SUM)
+    total_norm = local_sq_sum.sqrt()
 
-    # Single all-reduce operation
-    global_sq_sum = local_sq_sum.clone()
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(global_sq_sum, op=dist.ReduceOp.SUM)
-    global_sq_sum = global_sq_sum / replicate_factor
-
-    total_norm = global_sq_sum.sqrt()
-
-    # Only apply clipping when exceeding threshold
-    if total_norm.item() > max_norm:
-        clip_factor = max_norm / total_norm.item()
-        torch._foreach_mul_(all_param_grads, clip_factor)
+    # compute the clamped coefficient on-device and multiply unconditionally,
+    # matching torch.nn.utils.clip_grad_norm_, so that clipping itself never
+    # forces a host-device sync (callers may disable grad_clip_check_finite
+    # precisely to avoid per-step syncs)
+    clip_factor = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    torch._foreach_mul_(local_param_grads, clip_factor)
 
     return total_norm
 
@@ -290,6 +354,32 @@ def materialize_meta_states(module, device=None):
     return module
 
 
+_warmup = False
+
+
+def is_warmup():
+    """True while the runner is compiling graph variants rather than really training.
+
+    A module whose input shapes are not fully determined by the data it is given -- a text encoder
+    padding to the longest prompt in the batch, say -- reads this in its own `forward` and runs the
+    shapes it would otherwise compile lazily, stalling one rank at a time mid-run. Reading it in
+    `forward` is what keeps it correct: the module is entered through whatever wrapper holds it,
+    with its parameters gathered, at the batch size the caller really passed.
+    """
+    return _warmup
+
+
+@contextlib.contextmanager
+def warmup_mode(enable=True):
+    global _warmup
+    prev_enabled = _warmup
+    _warmup = enable
+    try:
+        yield
+    finally:
+        _warmup = prev_enabled
+
+
 @contextlib.contextmanager
 def gc_context(enable=False):
     prev_enabled = gc.isenabled()
@@ -304,6 +394,24 @@ def gc_context(enable=False):
             gc.enable()
         else:
             gc.disable()
+
+
+def onload(method):
+    """Decorate a module method (e.g. a VAE's encode/decode) to run a CPU-offloaded module (FSDP ``offload_keys``)
+    on the device of its first tensor argument, moving it back to CPU afterwards.
+
+    A no-op for modules that are not on CPU.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if next(self.parameters()).device.type != 'cpu':
+            return method(self, *args, **kwargs)
+        self.to(first_tensor_device((args, kwargs)))
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.to('cpu')
+    return wrapper
 
 
 def first_tensor_device(x: Any) -> Optional[torch.device]:

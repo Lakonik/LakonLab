@@ -20,8 +20,8 @@ from transformers.models.t5.modeling_t5 import T5Block
 from transformers.modeling_outputs import Seq2SeqLMOutput
 from mmcv.runner import get_dist_info
 from lakonlab.runner.checkpoint import load_checkpoint
-from lakonlab.utils.io_utils import hf_model_loader
-from .metrics import Metric
+from lakonlab.utils.io_utils import download_from_huggingface, hf_model_loader
+from .metrics import Metric, VideoAdapterMixin
 from .builder import METRICS
 
 
@@ -429,18 +429,23 @@ def load_vqascore(device, dtype, use_fsdp=True):
         'google/flan-t5-xxl', use_fast=False, model_max_length=2048)
     config, _ = hf_model_loader(
         CLIPT5ForConditionalGeneration.config_class,
-        'zhiqiulin/clip-flant5-xxl',
+        download_from_huggingface('huggingface://zhiqiulin/clip-flant5-xxl/config.json'),
         use_cache=False,
         freeze_mm_mlp_adapter=True,
         return_unused_kwargs=True)
     with init_empty_weights():
         model = CLIPT5ForConditionalGeneration(config)
+    revise_keys = [(r'^module\.', '')]
+    if not hasattr(model.get_vision_tower().vision_tower, 'vision_model'):
+        # transformers >= 5.6 flattened CLIPVisionModel; the checkpoint keeps the old nesting
+        revise_keys.append((r'^vision_tower\.vision_tower\.vision_model\.', 'vision_tower.vision_tower.'))
     load_checkpoint(
         model,
         'huggingface://zhiqiulin/clip-flant5-xxl/pytorch_model.bin.index.json',
         map_location='cpu',
         assign=True,
-        strict=True)
+        strict=True,
+        revise_keys=revise_keys)
     model.to(dtype=dtype)
     model.requires_grad_(False)
 
@@ -466,14 +471,17 @@ def load_vqascore(device, dtype, use_fsdp=True):
 
 
 @METRICS.register_module()
-class VQAScore(Metric):
+class VQAScore(VideoAdapterMixin, Metric):
     name = 'VQAScore'
     requires_prompt = True
 
     def __init__(self,
                  num_images=None,
-                 use_fsdp=True):
+                 use_fsdp=True,
+                 video_fps=16.0,
+                 sample_fps=1.0):
         super().__init__(num_images)
+        self.setup_video_adapter(video_fps, sample_fps)
         use_fsdp = use_fsdp and torch.cuda.is_available() and dist.is_initialized() and dist.get_world_size() > 0
 
         self.use_fsdp = use_fsdp
@@ -483,7 +491,8 @@ class VQAScore(Metric):
         self.model, self.tokenizer = load_vqascore(device=self.device, dtype=self.dtype, use_fsdp=use_fsdp)
         self.model.eval()
         image_processor = self.model.get_vision_tower().image_processor
-        image_size = tuple(image_processor.crop_size.values())
+        crop_size = image_processor.crop_size
+        image_size = (crop_size['height'], crop_size['width'])  # transformers >= 5 uses SizeDict
         assert len(image_size) == 2 and image_size[0] == image_size[1]
         self.image_size = image_size[0]
         self.image_mean = torch.tensor(image_processor.image_mean, device=self.device).view(3, 1, 1)
@@ -508,12 +517,8 @@ class VQAScore(Metric):
             imgs = torch.maximum(torch.minimum(imgs, self.clamp_high), self.clamp_low)
         return imgs
 
-    @torch.no_grad()
-    def feed_op(self, batch, mode):
-        imgs = batch['imgs']
-        prompts = batch['prompts']
-
-        imgs = (imgs.to(device=self.device, dtype=torch.float32) / 2 + 0.5).clamp(0, 1)
+    def _score_images(self, imgs, prompts):
+        imgs = imgs.to(device=self.device, dtype=torch.float32).clamp(0, 1)
         imgs = self.resize((imgs - self.image_mean) / self.image_std).to(dtype=self.dtype)
 
         # ========= preprocess prompts =========
@@ -556,6 +561,14 @@ class VQAScore(Metric):
         vqa_score = (-F.cross_entropy(
             logits.reshape(bs * seq_len, vocab_size), labels.reshape(bs * seq_len), reduction='none'
         ).reshape(bs, 2).mean(dim=1)).exp()  # (bs, )
+        return vqa_score
+
+    @torch.no_grad()
+    def feed_op(self, batch, mode):
+        imgs, prompts, video_shape = self._flatten_video_frames(
+            batch['imgs'], batch['prompts'])
+        vqa_score = self._score_images(imgs, prompts)
+        vqa_score = self._reduce_video_frame_scores(vqa_score, video_shape)
 
         if dist.is_initialized():
             ws = dist.get_world_size()

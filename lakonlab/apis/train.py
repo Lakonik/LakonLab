@@ -10,6 +10,7 @@ from lakonlab.utils import get_root_logger
 from lakonlab.parallel import apply_module_wrapper
 from lakonlab.runner.optimizer import build_optimizers
 from lakonlab.runner.checkpoint import exists_ckpt
+from lakonlab.runner.dynamic_iter_based_runner import get_stateful_sampler
 from lakonlab.runner.utils import set_random_seed
 
 
@@ -132,8 +133,9 @@ def train_model(model,
                 deterministic=cfg.get('deterministic', False),
                 use_rank_shift=cfg.get('diff_seed', False))
         for data_loader in data_loaders:
-            data_loader.sampler.set_epoch(runner.epoch)
-            data_loader.sampler.set_iter(runner.iter)
+            sampler = get_stateful_sampler(data_loader)
+            sampler.set_epoch(runner.epoch)
+            sampler.set_iter(runner.iter)
     elif exists_ckpt(cfg.load_from):
         runner.load_checkpoint(cfg.load_from, **ckpt_kwargs)
 

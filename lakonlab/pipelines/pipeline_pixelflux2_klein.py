@@ -113,7 +113,7 @@ class PixelFlux2KleinPipeline(Flux2KleinPipeline, LakonLabMixin):
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: str | list[str] | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
         output_type: str = "pil",
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
@@ -223,7 +223,7 @@ class PixelFlux2KleinPipeline(Flux2KleinPipeline, LakonLabMixin):
         # 6. Prepare timesteps
         image_seq_len = latents.shape[2:].numel()
         self.scheduler.set_timesteps(
-            num_inference_steps, seq_len=image_seq_len, device=self._execution_device)
+            num_inference_steps, sigmas=sigmas, seq_len=image_seq_len, device=self._execution_device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 

@@ -49,6 +49,10 @@ class FlowMapSDEScheduler(SchedulerMixin, ConfigMixin):
         self._begin_index = None
 
     @property
+    def num_timesteps(self):
+        return self.config.num_train_timesteps
+
+    @property
     def step_index(self):
         return self._step_index
 
@@ -116,9 +120,9 @@ class FlowMapSDEScheduler(SchedulerMixin, ConfigMixin):
         self.timesteps = sigmas * self.config.num_train_timesteps
         self.sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
 
-        sigmas_dst, m = self.calculate_sigmas_dst(self.sigmas)
+        sigmas_dst, M = self.calculate_sigmas_dst(self.sigmas)
         self.timesteps_dst = sigmas_dst * self.config.num_train_timesteps
-        self.m_vals = m
+        self.M_vals = M
 
         self._step_index = None
         self._begin_index = None
@@ -132,18 +136,18 @@ class FlowMapSDEScheduler(SchedulerMixin, ConfigMixin):
         alphas_to = alphas[1:]
 
         if self.config.h == 'inf':
-            m = torch.zeros_like(sigmas_src)
+            M = torch.zeros_like(sigmas_src)
         elif self.config.h == 0.0:
-            m = torch.ones_like(sigmas_src)
+            M = torch.ones_like(sigmas_src)
         else:
             assert self.config.h > 0.0
             h2 = self.config.h * self.config.h
-            m = (sigmas_to * alphas_src / (sigmas_src * alphas_to).clamp(min=eps)) ** h2
+            M = (sigmas_to * alphas_src / (sigmas_src * alphas_to).clamp(min=eps)) ** h2
 
-        sigmas_to_mul_m = sigmas_to * m
-        sigmas_dst = sigmas_to_mul_m / (alphas_to + sigmas_to_mul_m).clamp(min=eps)
+        sigmas_to_mul_M = sigmas_to * M
+        sigmas_dst = sigmas_to_mul_M / (alphas_to + sigmas_to_mul_M).clamp(min=eps)
 
-        return sigmas_dst, m
+        return sigmas_dst, M
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
         if schedule_timesteps is None:
@@ -191,12 +195,12 @@ class FlowMapSDEScheduler(SchedulerMixin, ConfigMixin):
 
         sigma_to = self.sigmas[self.step_index + 1].to(solver_dtype)
         alpha_to = 1 - sigma_to
-        m = self.m_vals[self.step_index].to(solver_dtype)
+        M = self.M_vals[self.step_index].to(solver_dtype)
 
         noise = randn_tensor(
             model_output.shape, dtype=solver_dtype, device=model_output.device, generator=generator)
 
-        prev_sample = (alpha_to + sigma_to * m) * model_output + sigma_to * (1 - m.square()).clamp(min=0).sqrt() * noise
+        prev_sample = (alpha_to + sigma_to * M) * model_output + sigma_to * (1 - M.square()).clamp(min=0).sqrt() * noise
 
         # Cast sample back to model compatible dtype
         prev_sample = prev_sample.to(ori_dtype)

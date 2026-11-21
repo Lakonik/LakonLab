@@ -1,38 +1,16 @@
-# Modified from https://github.com/open-mmlab/mmgeneration
-
-import warnings
-
-# suppress warnings from MMCV about optional dependencies
-warnings.filterwarnings(
-    'ignore',
-    category=UserWarning,
-    message=r'^Fail to import ``MultiScaleDeformableAttention`` from ``mmcv\.ops\.multi_scale_deform_attn``.*',
-    module=r'^mmcv\.cnn\.bricks\.transformer$',
-)
-
-import argparse
-import copy
-import multiprocessing as mp
 import os
 import os.path as osp
-import platform
+import argparse
+
+from lakonlab.utils.env import apply_default_env
+apply_default_env()
+
 import time
 import re
 from copy import deepcopy
 
 import torch
-from torch._inductor import config as torch_inductor_config
 
-# torch 2.11's slow cudagraph pool assertion snapshots storage liveness
-# before its internal gc.collect(), then compares against allocator state
-# after collection, which can report already-dead storages as phantom leaks.
-if torch.__version__.startswith('2.11.'):
-    torch_inductor_config.triton.slow_path_cudagraph_asserts = False
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-import cv2
 import mmcv
 from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
@@ -40,15 +18,13 @@ from mmcv.utils import get_git_hash
 
 import lakonlab.evaluation  # noqa: F401
 from lakonlab.models import build_model
-from lakonlab.datasets import build_dataset, build_dataloader, unique_dataloaders
+from lakonlab.datasets import build_dataset, build_dataloader, shared_parse_cache, unique_dataloaders
 from lakonlab.apis import train_model
 from lakonlab.runner.checkpoint import clear_checkpoint_cache
 from lakonlab.runner.utils import set_random_seed
-from lakonlab.utils import get_root_logger, collect_env
+from lakonlab.utils import get_root_logger, collect_env, setup_global_config, setup_multi_processes
 from lakonlab.parallel.utils import prepare_module_wrapper
 from lakonlab import __version__
-
-cv2.setNumThreads(0)
 
 
 def parse_args():
@@ -78,7 +54,7 @@ def parse_args():
         'in xxx=yyy format will be merged into config file.')
     parser.add_argument(
         '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi', 'flyte'],
+        choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
     parser.add_argument('--local-rank', '--local_rank', type=int, default=0)
@@ -87,39 +63,6 @@ def parse_args():
         os.environ['LOCAL_RANK'] = str(args.local_rank)
 
     return args
-
-
-def setup_multi_processes(cfg):
-    # set multi-process start method as `fork` to speed up the training
-    if platform.system() != 'Windows':
-        mp_start_method = cfg.get('mp_start_method', 'fork')
-        if mp.get_start_method(allow_none=True) is None:
-            mp.set_start_method(mp_start_method)
-
-    # disable opencv multithreading to avoid system being overloaded
-    opencv_num_threads = cfg.get('opencv_num_threads', 0)
-    cv2.setNumThreads(opencv_num_threads)
-
-    # setup OMP threads
-    # This code is referred from https://github.com/pytorch/pytorch/blob/master/torch/distributed/run.py  # noqa
-    if ('OMP_NUM_THREADS' not in os.environ and cfg.data.workers_per_gpu > 1):
-        omp_num_threads = 1
-        warnings.warn(
-            f'Setting OMP_NUM_THREADS environment variable for each process '
-            f'to be {omp_num_threads} in default, to avoid your system being '
-            f'overloaded, please further tune the variable for optimal '
-            f'performance in your application as needed.')
-        os.environ['OMP_NUM_THREADS'] = str(omp_num_threads)
-
-    # setup MKL threads
-    if 'MKL_NUM_THREADS' not in os.environ and cfg.data.workers_per_gpu > 1:
-        mkl_num_threads = 1
-        warnings.warn(
-            f'Setting MKL_NUM_THREADS environment variable for each process '
-            f'to be {mkl_num_threads} in default, to avoid your system being '
-            f'overloaded, please further tune the variable for optimal '
-            f'performance in your application as needed.')
-        os.environ['MKL_NUM_THREADS'] = str(mkl_num_threads)
 
 
 def main():
@@ -135,9 +78,7 @@ def main():
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings
         import_modules_from_strings(**cfg['custom_imports'])
-    # set cudnn_benchmark
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
+    setup_global_config(dict(cfg.get('global_config', dict())))
 
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
@@ -155,8 +96,7 @@ def main():
         distributed = False
     else:
         distributed = True
-        if args.launcher != 'flyte':  # flyte launcher already sets up the distributed environment
-            init_dist(args.launcher, **cfg.dist_params)
+        init_dist(args.launcher, **cfg.dist_params)
         _, world_size = get_dist_info()
 
     # create work_dir
@@ -202,49 +142,51 @@ def main():
     meta['exp_name'] = osp.basename(args.config)
 
     # build datasets and dataloaders before building the model
-    datasets = [build_dataset(cfg.data.train)]
-    if len(cfg.workflow) == 2:
-        val_dataset = copy.deepcopy(cfg.data.val)
-        val_dataset.pipeline = cfg.data.val.pipeline
-        datasets.append(build_dataset(val_dataset))
+    # datasets sharing metadata or datalists parse each file once; the cache is dropped before workers fork
+    with shared_parse_cache():
+        datasets = [build_dataset(cfg.data.train)]
+        if len(cfg.workflow) == 2:
+            val_dataset = deepcopy(cfg.data.val)
+            val_dataset.pipeline = cfg.data.val.pipeline
+            datasets.append(build_dataset(val_dataset))
 
-    # default loader config
-    loader_cfg = dict(
-        seed=cfg.seed)
+        # default loader config
+        loader_cfg = dict(
+            seed=cfg.seed)
 
-    # The overall dataloader settings
-    loader_cfg.update({
-        k: v
-        for k, v in cfg.data.items()
-        if k not in [
-            'train', 'train_dataloader', 'val_dataloader', 'test_dataloader'
-        ] and not re.fullmatch(r'(val|test)\d*', k)
-    })
+        # The overall dataloader settings
+        loader_cfg.update({
+            k: v
+            for k, v in cfg.data.items()
+            if k not in [
+                'train', 'train_dataloader', 'val_dataloader', 'test_dataloader'
+            ] and not re.fullmatch(r'(val|test)\d*', k)
+        })
 
-    # The specific datalaoder settings
-    train_loader_cfg = {**loader_cfg, **cfg.data.get('train_dataloader', dict())}
+        # The specific datalaoder settings
+        train_loader_cfg = {**loader_cfg, **cfg.data.get('train_dataloader', dict())}
 
-    data_loaders = [build_dataloader(ds, **train_loader_cfg) for ds in datasets]
+        data_loaders = [build_dataloader(ds, **train_loader_cfg) for ds in datasets]
 
-    if not args.no_validate and cfg.get('evaluation', None) is not None:
-        assert isinstance(cfg.evaluation, list)
-        _evaluation = []
-        eval_dataloaders = dict()
-        for eval_cfg_ in cfg.evaluation:
-            if eval_cfg_.data in eval_dataloaders:
-                val_dataloader = eval_dataloaders[eval_cfg_.data]
-            else:
-                val_dataset = build_dataset(cfg.data[eval_cfg_.data])
-                val_loader_cfg = {
-                    **loader_cfg, 'shuffle': False,
-                    **cfg.data.get('val_dataloader', dict())
-                }
-                val_dataloader = build_dataloader(val_dataset, **val_loader_cfg)
-                eval_dataloaders[eval_cfg_.data] = val_dataloader
-            eval_cfg = deepcopy(eval_cfg_)
-            eval_cfg.update(dict(dist=distributed, dataloader=val_dataloader))
-            _evaluation.append(eval_cfg)
-        cfg.evaluation = _evaluation
+        if not args.no_validate and cfg.get('evaluation', None) is not None:
+            assert isinstance(cfg.evaluation, list)
+            _evaluation = []
+            eval_dataloaders = dict()
+            for eval_cfg_ in cfg.evaluation:
+                if eval_cfg_.data in eval_dataloaders:
+                    val_dataloader = eval_dataloaders[eval_cfg_.data]
+                else:
+                    val_dataset = build_dataset(cfg.data[eval_cfg_.data])
+                    val_loader_cfg = {
+                        **loader_cfg, 'shuffle': False,
+                        **cfg.data.get('val_dataloader', dict())
+                    }
+                    val_dataloader = build_dataloader(val_dataset, **val_loader_cfg)
+                    eval_dataloaders[eval_cfg_.data] = val_dataloader
+                eval_cfg = deepcopy(eval_cfg_)
+                eval_cfg.update(dict(dist=distributed, dataloader=val_dataloader))
+                _evaluation.append(eval_cfg)
+            cfg.evaluation = _evaluation
 
     # warm up dataloader workers
     for data_loader in unique_dataloaders(
@@ -273,6 +215,9 @@ def main():
         validate=(not args.no_validate),
         timestamp=timestamp,
         meta=meta)
+
+    if distributed and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == '__main__':

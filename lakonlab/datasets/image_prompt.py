@@ -17,17 +17,15 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-import torch.storage
-torch.storage.UntypedStorage.dtype = torch.uint8  # hot patch for torch 2.6 deserialization
 
 from datasets import load_dataset, DatasetDict, Dataset as HFDataset
 import mmcv
-from mmcv.fileio import FileClient
 from mmcv.parallel import DataContainer as DC
 
+from .base import read_jsonl
 from .builder import DATASETS
 from lakonlab.utils import get_root_logger
-from lakonlab.utils.io_utils import load_image
+from lakonlab.utils.io_utils import load_image_or_video, FileClient
 
 
 @DATASETS.register_module()
@@ -54,7 +52,8 @@ class ImagePrompt(Dataset):
             with prompts (used only in prompt-dataset mode).
         image_datalist_path (Optional[str]): Optional datalist for `image_dir`
             (same formats as above). When `bucketize=True`, JSONL entries must
-            include `"size_idx"`.
+            include `"size_idx"` or `"bucket_id"`. Without `image_dir`, the datalist still
+            supplies bucket IDs and `image_size` metadata without loading images.
         image_extension (Optional[str]): Image file extension used to compose
             paths when `image_dir` is set. Defaults to ".png".
         image_scale_factor (float): Scale factor applied to image spatial dimensions
@@ -130,6 +129,7 @@ class ImagePrompt(Dataset):
                  start_ind: Optional[int] = None,
                  end_ind: int = None,
                  bucketize: bool = False,
+                 bucket_samples_per_gpu: Optional[Union[int, dict]] = None,
                  prompt_key: str = 'prompt',
                  test_mode: bool = False):
         super().__init__()
@@ -141,6 +141,7 @@ class ImagePrompt(Dataset):
 
         self.cache_dir_path = self.cache_datalist_path = None
         self.prompt_dataset = self.image_dir_path = self.condition_image_dir_path = None
+        self.image_sizes = None
         self.image_extension = image_extension
         self.image_scale_factor = image_scale_factor
         self.condition_image_extension = condition_image_extension
@@ -186,6 +187,7 @@ class ImagePrompt(Dataset):
         if image_dir is not None and _file_client.isdir(
                 _file_client.join_path(data_root, image_dir)):
             self.image_dir_path = _file_client.join_path(data_root, image_dir)
+        if self.image_dir_path is not None or image_datalist_path is not None:
             self.image_datalist, bucket_ids, self.image_sizes = self.parse_datalist(
                 self.image_dir_path, image_datalist_path, datalist_must_exist=True)
             assert dataset_len == len(self.image_datalist)
@@ -232,7 +234,15 @@ class ImagePrompt(Dataset):
 
         if self.bucketize:
             assert bucket_ids is not None and len(bucket_ids) == dataset_len
-            self.bucket_ids = [bucket_ids[self._map_idx(i)] for i in range(len(self))]
+            # an int16 array rather than a list of Python ints, which costs GBs per rank once
+            # `repeat` inflates the sample count
+            self.bucket_ids = np.asarray(bucket_ids, dtype=np.int16)[
+                self.start_ind + np.arange(len(self)) // self.repeat]
+            if bucket_samples_per_gpu is not None:
+                self.bucket_samples_per_gpu = self._parse_bucket_samples_per_gpu(
+                    bucket_samples_per_gpu)
+        elif bucket_samples_per_gpu is not None:
+            raise ValueError('bucket_samples_per_gpu requires bucketize=True.')
 
         self.test_mode = test_mode
 
@@ -259,6 +269,25 @@ class ImagePrompt(Dataset):
         _, inv = np.unique(arrs, axis=0, return_inverse=True)
         return inv.tolist()
 
+    def _parse_bucket_samples_per_gpu(self, bucket_samples_per_gpu):
+        bucket_ids = np.unique(self.bucket_ids).tolist()
+        if isinstance(bucket_samples_per_gpu, int):
+            mapping = {bucket_id: bucket_samples_per_gpu for bucket_id in bucket_ids}
+        elif isinstance(bucket_samples_per_gpu, dict):
+            mapping = {int(k): v for k, v in bucket_samples_per_gpu.items()}
+            if set(mapping) != set(bucket_ids):
+                raise ValueError('bucket_samples_per_gpu keys must match bucket ids.')
+        else:
+            raise TypeError(
+                'bucket_samples_per_gpu must be an int or a dict from bucket id to samples_per_gpu.')
+
+        for bucket_id, samples_per_gpu in mapping.items():
+            if not isinstance(samples_per_gpu, int) or samples_per_gpu <= 0:
+                raise ValueError(
+                    f'bucket_samples_per_gpu[{bucket_id}] must be a positive integer, '
+                    f'but got {samples_per_gpu}.')
+        return mapping
+
     def parse_datalist(self, dir_path, datalist_path=None, datalist_must_exist=False, ignore_bucket_ids=False):
         logger = get_root_logger()
 
@@ -267,15 +296,8 @@ class ImagePrompt(Dataset):
             bucket_ids = []
             image_sizes = []
 
-            datalist_bytesio = BytesIO(FileClient.infer_client(uri=datalist_path).get(datalist_path))
             if datalist_path.endswith('.jsonl.gz') or datalist_path.endswith('.jsonl'):
-                if datalist_path.endswith('.jsonl.gz'):
-                    with gzip.open(datalist_bytesio, 'rt', encoding='utf-8') as f:
-                        datalist = f.readlines()
-                else:
-                    datalist = datalist_bytesio.read().decode('utf-8').splitlines()
-                for line in datalist:
-                    data_item = orjson.loads(line)
+                for data_item in read_jsonl(datalist_path):
                     if 'filename' in data_item:
                         filenames.append(data_item['filename'])
                     elif 'image_hash' in data_item:
@@ -296,7 +318,7 @@ class ImagePrompt(Dataset):
                         image_sizes.append(None)
             elif datalist_path.endswith('.json'):
                 assert not self.bucketize, 'Bucketize not supported for json datalist.'
-                datalist = orjson.loads(datalist_bytesio.read())
+                datalist = orjson.loads(FileClient.infer_client(uri=datalist_path).get(datalist_path))
                 for data_item in datalist:
                     filenames.append(os.path.splitext(os.path.basename(data_item))[0])
             else:
@@ -583,7 +605,7 @@ class ImagePrompt(Dataset):
                 image_path = self.file_client.join_path(
                     self.image_dir_path, self.image_datalist[mapped_idx] + self.image_extension)
                 image_size = self.image_sizes[mapped_idx] if self.image_sizes is not None else None
-                image = load_image(image_path, self.file_client, target_size=image_size)
+                image = load_image_or_video(image_path, self.file_client, target_size=image_size)
                 image = np.moveaxis(image, -1, 0)  # channel first
                 if self.test_mode:
                     data['noise'] = torch.randn(
@@ -597,7 +619,10 @@ class ImagePrompt(Dataset):
                     assert torch.is_floating_point(images), f'Image dtype {images.dtype} not supported.'
                     data['images'] = self.scale_image(images.float(), self.image_scale_factor)
             elif 'latents' not in data and 'noise' not in data:  # allocate latents if not already loaded
-                if prompt_data is not None and 'height' in prompt_data and 'width' in prompt_data:
+                if self.image_sizes is not None and self.image_sizes[mapped_idx] is not None:
+                    latent_size = self.calculate_latent_size(self.calculate_scaled_image_size(
+                        self.image_sizes[mapped_idx], self.image_scale_factor))
+                elif prompt_data is not None and 'height' in prompt_data and 'width' in prompt_data:
                     image_spatial_size = (prompt_data['height'], prompt_data['width'])
                     if 'frames' in prompt_data:
                         image_spatial_size = (prompt_data['frames'],) + image_spatial_size
@@ -619,7 +644,7 @@ class ImagePrompt(Dataset):
                     self.condition_image_datalist[mapped_idx] + self.condition_image_extension)
                 condition_image_size = self.condition_image_sizes[mapped_idx] \
                     if self.condition_image_sizes is not None else None
-                condition_image = load_image(condition_image_path, self.file_client, target_size=condition_image_size)
+                condition_image = load_image_or_video(condition_image_path, self.file_client, target_size=condition_image_size)
                 condition_image = np.moveaxis(condition_image, -1, 0)  # channel first
                 condition_images = torch.from_numpy(condition_image)
                 if condition_images.dtype == torch.uint8:

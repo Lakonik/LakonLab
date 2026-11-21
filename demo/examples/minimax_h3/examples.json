@@ -1,0 +1,35 @@
+[
+  {
+    "label": "Your render outlived you",
+    "prompt": "integrated_multimodal_description: [Shot 1] Live-action, epic cinematic, a slow push-in through a dim, dusty server room overgrown with thick cobwebs, a single ancient computer monitor glowing at the center of the frame showing a progress bar stuck at \"99%\", a skeleton in an office chair slumped in front of it with one bony finger still on the mouse, dust drifting through a shaft of cold light. A deep, gravelly movie-trailer narrator (S1) says off-screen: <d>[English] In a world where your render outlived you...</d>\n\noverall_soundscape: A low electrical hum, the slow creak of the office chair, and a single cooling fan rattling and winding down.\n\nnon_diegetic_music: Ominous low brass and taiko drums build slowly.",
+    "in_image": null,
+    "in_last_image": null,
+    "aspect_ratio": "16:9",
+    "megapixels": 1.0,
+    "duration": 5.0,
+    "steps": 2,
+    "seed": 1034413408
+  },
+  {
+    "label": "Distracted boyfriend",
+    "prompt": "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\nintegrated_multimodal_description: [Shot 1] Live-action, candid street photography look with shallow depth of field, the three people shown in <Picture 1> walk along a sunlit European city street, preserving their exact positions: the woman in the red sleeveless top at the left foreground walking away from the camera, the young man in the blue plaid short-sleeve shirt at the center with his head turned back over his left shoulder toward the woman in red, and his girlfriend in the light blue sleeveless top at the right, staring at him with her mouth open in disbelief. The blurred stone buildings and warm afternoon light are preserved. The camera holds a static shot. The man's head keeps turning further toward the woman in red, his whole upper body twisting now, and he stumbles slightly on the pavement as he stops watching where he's walking. His girlfriend's expression sharpens, she yanks her hand free from his and smacks him on the upper arm with her open palm. The girlfriend with an offended, sharp, loud voice (S1) says: <d>[Spanish] ¿En serio?</d> He flinches and snaps his head back toward her, raising both hands in front of his chest. The woman in red glances back over her right shoulder with a small smirk and keeps walking out of the left edge of the frame.\n\noverall_soundscape: Footsteps on stone pavement, distant city traffic, the slap of a palm on a cloth sleeve, and a faint murmur of pedestrians in the background.\n\nnon_diegetic_music: N/A",
+    "in_image": "https://huggingface.co/spaces/Lakonik/pi-H3/resolve/main/demo/examples/minimax_h3/distracted_boyfriend.webp",
+    "in_last_image": null,
+    "aspect_ratio": "16:9",
+    "megapixels": 1.0,
+    "duration": 5.0,
+    "steps": 2,
+    "seed": 1262275999
+  },
+  {
+    "label": "Woman yelling at cat",
+    "prompt": "How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) aligns with the 0.00-second mark of the target video; <Picture 2> (from [Shot 2]) aligns with the 10.00-second mark of the target video.\n\nintegrated_multimodal_description: [Shot 1] Live-action, reality TV look with shallow depth of field, the scene shown in <Picture 1> at an outdoor restaurant patio in warm afternoon sunlight, preserving all positions: the blonde woman in the black sleeveless top at the center-left, mouth wide open and right arm extended pointing toward the camera, pearl bracelets on her wrist, a small white fluffy dog on her lap, and the dark-haired woman in the beige lace top behind her at the right, gripping her arm and looking alarmed. A marble table in the foreground holds a green salad plate, a glass of white wine, water glasses, and white hydrangeas. Diners sit in soft focus behind a black iron railing in the background. The camera holds a static shot. The blonde woman leans further forward, her pointing finger jabbing the air, and she slams her other hand flat on the table, rattling the glasses and sloshing wine. The blonde woman with a loud, high, furious voice (S1) shouts: <d>[English] I had a meeting on Zoom and you walked across the keyboard!</d> [Shot 2] At 00:05.000, the camera cuts to a dim indoor restaurant booth, where the white cat shown in <Picture 2> sits behind a dark table in a dark leather booth seat, its head just above table height. A man walks into the frame from the right edge and pets the cat's head as the cat meows quietly, and then the man puts his hand on the chair above the cat. Canned sitcom laughter. The camera holds a static shot. The cat blinks once, slowly, and the laughter dies down. Its left ear flattens back. It looks down at the salad, then back up at the camera with the same flat expression. The scene settles into the exact composition, lighting, and framing of <Picture 2>.\n\noverall_soundscape: Outdoor patio ambience with clinking glasses, distant conversation, and birds in the background during the first shot. A hand slaps the marble table with a sharp smack and wine sloshes in the glass. The small dog barks in sharp, rapid bursts. After the cut, the sound drops to a quiet indoor room with faint restaurant murmur. Two bursts of canned sitcom studio audience laughter play, the first loud and long on the cut, the second shorter after the cat looks back up.\n\nnon_diegetic_music: N/A",
+    "in_image": "https://huggingface.co/spaces/Lakonik/pi-H3/resolve/main/demo/examples/minimax_h3/woman_cat_meme_first.webp",
+    "in_last_image": "https://huggingface.co/spaces/Lakonik/pi-H3/resolve/main/demo/examples/minimax_h3/woman_cat_meme_last.webp",
+    "aspect_ratio": "16:9",
+    "megapixels": 1.0,
+    "duration": 10.0,
+    "steps": 2,
+    "seed": 14851915
+  }
+]

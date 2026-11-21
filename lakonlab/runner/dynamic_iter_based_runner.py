@@ -2,15 +2,17 @@ import gc
 import copy
 import warnings
 import time
-import os.path as osp
 import threading
 from functools import partial
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import BatchSampler, DataLoader
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict, StateDictOptions
 from torch.cuda.amp import GradScaler
 
@@ -19,10 +21,52 @@ from mmcv.parallel import collate, is_module_wrapper
 from mmcv.runner import HOOKS, RUNNERS, IterBasedRunner, get_host_info, get_dist_info
 
 from .checkpoint import get_checkpoint, load_checkpoint, write_checkpoint_to_file
-from lakonlab.utils import rgetattr, gc_context
+from .utils import preserve_rng_state
+from lakonlab.utils.io_utils import FileClient
+from lakonlab.utils import rgetattr, gc_context, warmup_mode
 
 _last_save_thread: threading.Thread | None = None
 _last_save_lock = threading.Lock()        # protects _last_save_thread
+
+
+def load_optimizer_state_dict(model, optimizer, optim_state_dict):
+    """Restore optimizer state, keeping configured LRs and filling missing group options."""
+    configured_groups = [
+        {k: v for k, v in group.items() if k != 'params'}
+        for group in optimizer.param_groups]
+    for group, ckpt_group in zip(optimizer.param_groups, optim_state_dict['param_groups']):
+        for k, v in ckpt_group.items():  # scheduler keys (e.g. initial_lr) unknown to a fresh optimizer break DCP's unflatten
+            group.setdefault(k, v)
+
+    def fill_missing_group_options(_optimizer, state_dict):
+        # DCP can leave options missing when one saved group is split into several.
+        for group, configured_group in zip(state_dict['param_groups'], configured_groups):
+            for k, v in configured_group.items():
+                group.setdefault(k, v)
+
+    load_hook = optimizer.register_load_state_dict_pre_hook(fill_missing_group_options)
+    try:
+        set_optimizer_state_dict(
+            model=model,
+            optimizers=optimizer,
+            optim_state_dict=optim_state_dict,
+            options=StateDictOptions(
+                full_state_dict=isinstance(model, FSDP) or isinstance(model, FSDPModule),
+                broadcast_from_rank0=False,
+                strict=False))
+    finally:
+        load_hook.remove()
+    for group, configured_group in zip(optimizer.param_groups, configured_groups):
+        group['lr'] = configured_group['lr']
+        group['initial_lr'] = configured_group['lr']
+
+
+def get_stateful_sampler(data_loader):
+    # Fixed-size dataloaders keep state on sampler; variable-size bucket
+    # dataloaders pass our stateful sampler directly as batch_sampler.
+    if isinstance(data_loader.batch_sampler, BatchSampler):
+        return data_loader.sampler
+    return data_loader.batch_sampler
 
 
 class IterLoader:
@@ -70,12 +114,11 @@ class IterLoader:
             update_flag = False
         if update_flag:
             # the sampler should be updated with the modified dataset
-            assert hasattr(self._dataloader.sampler, 'update_sampler')
+            sampler = get_stateful_sampler(self._dataloader)
             samples_per_gpu = None if not hasattr(
                 self._dataloader.dataset, 'samples_per_gpu'
             ) else self._dataloader.dataset.samples_per_gpu
-            self._dataloader.sampler.update_sampler(self._dataloader.dataset,
-                                                    samples_per_gpu)
+            sampler.update_sampler(self._dataloader.dataset, samples_per_gpu)
             # update samples per gpu
             if samples_per_gpu is not None:
                 if dist.is_initialized():
@@ -104,8 +147,8 @@ class IterLoader:
             data = next(self.iter_loader)
         except StopIteration:
             self._epoch += 1
-            if hasattr(self._dataloader.sampler, 'set_epoch'):
-                self._dataloader.sampler.set_epoch(self._epoch)
+            sampler = get_stateful_sampler(self._dataloader)
+            sampler.set_epoch(self._epoch)
             self.iter_loader = iter(self._dataloader)
             data = next(self.iter_loader)
 
@@ -113,6 +156,21 @@ class IterLoader:
 
     def __len__(self):
         return len(self._dataloader)
+
+
+BUCKET_SCAN_CHUNK = 1 << 20
+
+
+def first_bucket_indices(bucket_ids, bucket_id, count):
+    """The first `count` dataset indices in a bucket, scanned in chunks so a dataset weighted up
+    by `repeat` does not allocate an index array of its whole length."""
+    indices = []
+    for start in range(0, len(bucket_ids), BUCKET_SCAN_CHUNK):
+        chunk = bucket_ids[start:start + BUCKET_SCAN_CHUNK]
+        indices.extend((np.flatnonzero(chunk == bucket_id) + start)[:count - len(indices)].tolist())
+        if len(indices) >= count:
+            break
+    return indices
 
 
 @RUNNERS.register_module(force=True)
@@ -129,6 +187,7 @@ class DynamicIterBasedRunner(IterBasedRunner):
                  ckpt_fp16_ema=False,
                  ckpt_bf16_optim=False,
                  gc_interval=-1,
+                 bucket_warmup=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -166,6 +225,7 @@ class DynamicIterBasedRunner(IterBasedRunner):
         self.ckpt_bf16_optim = ckpt_bf16_optim
         self.gc_interval = gc_interval
         self.manual_gc = isinstance(gc_interval, int) and gc_interval > 0
+        self.bucket_warmup = bucket_warmup
 
     def call_hook(self, fn_name):
         """Call all hooks.
@@ -229,11 +289,67 @@ class DynamicIterBasedRunner(IterBasedRunner):
         if not isinstance(outputs, dict):
             raise TypeError('model.train_step() must return a dict')
         if 'log_vars' in outputs:
-            self.log_buffer.update(outputs['log_vars'], outputs['num_samples'])
+            self.log_buffer.update(outputs['log_vars'], 1)
         self.outputs = outputs
         self.call_hook('after_train_iter')
         self._inner_iter += 1
         self._iter += 1
+
+    def run_bucket_warmup(self, data_loader, **kwargs):
+        """Run one real training step per data bucket before the training loop.
+
+        Compiles every (batch shape, training step) graph variant up front on
+        all ranks simultaneously; lazily-compiled shapes would otherwise stall
+        the whole job whenever any rank first encounters a bucket. `warmup_mode`
+        additionally lets a module compile shapes the bucket does not determine,
+        such as a text encoder padding to the longest prompt in the batch. Runs once
+        per launch, including resumes, and leaves no trace on the training
+        dynamics: an empty optimizer dict makes the optimizer interactions
+        no-ops (parameters, optimizer state and learning rates untouched; the
+        warmup gradients are discarded by the next real training step's
+        zero_grad), and buffers (running stats) and RNG streams are snapshotted
+        and restored around the warmup steps.
+        """
+        dataset = data_loader.dataset
+        if hasattr(dataset, 'bucket_ids'):
+            bucket_ids = np.asarray(dataset.bucket_ids)
+            warmup_batches = []
+            for bucket_id in np.unique(bucket_ids).tolist():
+                if hasattr(dataset, 'bucket_samples_per_gpu'):
+                    samples_per_gpu = dataset.bucket_samples_per_gpu[bucket_id]
+                else:
+                    samples_per_gpu = data_loader.batch_size
+                warmup_batches.append((
+                    bucket_id, first_bucket_indices(bucket_ids, bucket_id, samples_per_gpu)))
+        else:
+            warmup_batches = [(None, list(range(data_loader.batch_size or 1)))]
+
+        self.model.train()
+        if self.pass_training_status:
+            kwargs['running_status'] = dict(iteration=self.iter, epoch=self.epoch)
+        if self.is_dynamic_ddp:
+            kwargs.update(dict(ddp_reducer=self.model.reducer))
+        if self.with_fp16_grad_scaler:
+            kwargs.update(dict(loss_scaler=self.loss_scaler))
+        if self.use_apex_amp:
+            kwargs.update(dict(use_apex_amp=True))
+
+        buffer_backup = {name: buf.clone() for name, buf in self.model.named_buffers()}
+
+        with warmup_mode(), preserve_rng_state():
+            for step, (bucket_id, indices) in enumerate(warmup_batches):
+                start_time = time.time()
+                data_batch = collate([dataset[i] for i in indices], samples_per_gpu=len(indices))
+                self.model.train_step(
+                    data_batch, dict() if isinstance(self.optimizer, dict) else None, **kwargs)
+                self.logger.info(
+                    f'Bucket warmup step {step + 1}/{len(warmup_batches)} '
+                    f'(bucket_id={bucket_id}, bs={len(indices)}): '
+                    f'{time.time() - start_time:.1f}s')
+
+        for name, buf in self.model.named_buffers():
+            if name in buffer_backup:
+                buf.copy_(buffer_backup[name])
 
     def run(self, data_loaders, workflow, max_iters=None, **kwargs):
         assert isinstance(data_loaders, list)
@@ -253,6 +369,11 @@ class DynamicIterBasedRunner(IterBasedRunner):
         self.logger.info('workflow: %s, max: %d iters', workflow,
                          self._max_iters)
         self.call_hook('before_run')
+
+        if self.bucket_warmup:
+            for loader, flow in zip(data_loaders, workflow):
+                if flow[0] == 'train':
+                    self.run_bucket_warmup(loader, **kwargs)
 
         iter_loaders = [IterLoader(x, self) for x in data_loaders]
 
@@ -300,7 +421,7 @@ class DynamicIterBasedRunner(IterBasedRunner):
             meta.update(self.meta)
 
         filename = filename_tmpl.format(self.iter + 1)
-        filepath = osp.join(out_dir, filename)
+        filepath = FileClient.infer_client(uri=out_dir).join_path(out_dir, filename)
         optimizer = self.optimizer if save_optimizer else None
         _loss_scaler = self.loss_scaler if self.with_fp16_grad_scaler else None
         checkpoint = get_checkpoint(
@@ -368,13 +489,8 @@ class DynamicIterBasedRunner(IterBasedRunner):
 
         if 'optimizer' in checkpoint and resume_optimizer:
             if isinstance(self.optimizer, Optimizer):
-                set_optimizer_state_dict(
-                    model=self.model,
-                    optimizers=self.optimizer,
-                    optim_state_dict=checkpoint['optimizer'],
-                    options=StateDictOptions(
-                        full_state_dict=isinstance(self.model, FSDP),
-                        broadcast_from_rank0=False))
+                load_optimizer_state_dict(
+                    self.model, self.optimizer, checkpoint['optimizer'])
             elif isinstance(self.optimizer, dict):
                 for k in self.optimizer.keys():
                     if k not in checkpoint['optimizer']:
@@ -383,13 +499,8 @@ class DynamicIterBasedRunner(IterBasedRunner):
                             'skipping loading optimizer state for this module.')
                         continue
                     m = rgetattr(self.model, k)
-                    set_optimizer_state_dict(
-                        model=m,
-                        optimizers=self.optimizer[k],
-                        optim_state_dict=checkpoint['optimizer'][k],
-                        options=StateDictOptions(
-                            full_state_dict=isinstance(m, FSDP),
-                            broadcast_from_rank0=False))
+                    load_optimizer_state_dict(
+                        m, self.optimizer[k], checkpoint['optimizer'][k])
             else:
                 raise TypeError(
                     'Optimizer should be dict or torch.optim.Optimizer '

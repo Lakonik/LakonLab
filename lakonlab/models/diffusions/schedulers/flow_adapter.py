@@ -85,6 +85,10 @@ class FlowAdapterScheduler(SchedulerMixin, ConfigMixin):
         self._begin_index = None
 
     @property
+    def num_timesteps(self):
+        return self.config.num_train_timesteps
+
+    @property
     def step_index(self):
         return self._step_index
 
@@ -220,7 +224,7 @@ class FlowAdapterScheduler(SchedulerMixin, ConfigMixin):
         if hasattr(self.base_scheduler, 'is_scale_input_called'):
             self.base_scheduler.is_scale_input_called = True
         kwargs = dict(return_dict=False)
-        if generator is not None:
+        if 'generator' in inspect.signature(self.base_scheduler.step).parameters:
             kwargs.update(generator=generator)
 
         if self.config.base_scheduler in [

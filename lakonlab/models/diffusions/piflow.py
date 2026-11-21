@@ -1,19 +1,27 @@
 # Copyright (c) 2026 Hansheng Chen
 
-import sys
-import inspect
+import tqdm
+from dataclasses import dataclass
 from copy import deepcopy
 from functools import partial
 
 import torch
-import mmcv
+from diffusers.utils.torch_utils import randn_tensor
 
+from ..base import MultistepState
 from ..builder import MODULES
-from . import GaussianFlow, schedulers
+from . import GaussianFlow
 from .piflow_policies import POLICY_CLASSES, GMFlowPolicy
 from lakonlab.models.architectures.utils import get_module_device
 from lakonlab.utils import module_eval
 from lakonlab.runner.timer import default_timers
+
+
+@dataclass(kw_only=True, slots=True)
+class PiFlowState(MultistepState):
+    teacher_ratio: float
+    x_t_src: torch.Tensor
+    raw_t_src: torch.Tensor
 
 
 class PiFlowImitationBase(GaussianFlow):
@@ -166,49 +174,29 @@ class PiFlowImitationBase(GaussianFlow):
         return loss, x_t_dst, raw_t_dst
 
     def forward_test(
-            self, x_0=None, noise=None, guidance_scale=None,
-            test_cfg_override=dict(), show_pbar=False, **kwargs):
-        x_t_src = torch.randn_like(x_0) if noise is None else noise
+            self, x_0=None, noise=None, guidance_scale=None, test_cfg_override=dict(),
+            show_pbar=False, sample_callback=None, generator=None, tqdm_cls=tqdm.tqdm, **kwargs):
+        x_t_src = randn_tensor(
+            x_0.shape, dtype=x_0.dtype, device=x_0.device, generator=generator) if noise is None else noise
         num_batches = x_t_src.size(0)
         seq_len = x_t_src.shape[2:].numel()  # h * w or t * h * w
         ori_dtype = x_t_src.dtype
-        device = x_t_src.device
         x_t_src = x_t_src.float()
         ndim = x_t_src.dim()
         assert ndim in [4, 5], f'Invalid x_t_src shape: {x_t_src.shape}. Expected 4D or 5D tensor.'
 
         cfg = deepcopy(self.test_cfg)
-        cfg.update(test_cfg_override)
+        cfg.update(deepcopy(test_cfg_override))
 
         total_substeps = cfg.get('total_substeps', 128)
         eps = cfg.get('eps', 1e-4)
-        nfe = cfg.get('nfe', None)
-        sigmas = cfg.get('sigmas', None)
-        if sigmas is not None:
-            nfe = len(sigmas)
 
-        sampler = cfg.get('sampler', 'FlowMapSDE')
-        sampler_class = getattr(schedulers, sampler + 'Scheduler', None)
-        if sampler_class is None:
-            raise AttributeError(f'Cannot find sampler [{sampler}].')
-
-        sampler_kwargs = cfg.get('sampler_kwargs', {})
-        signatures = inspect.signature(sampler_class).parameters.keys()
-        for key in ['shift', 'use_dynamic_shifting', 'base_seq_len', 'max_seq_len', 'base_logshift', 'max_logshift']:
-            if key in signatures and key not in sampler_kwargs:
-                sampler_kwargs[key] = cfg.get(key, getattr(self.timestep_sampler, key))
-        if 'final_step_size_scale' in cfg:
-            sampler_kwargs['final_step_size_scale'] = cfg['final_step_size_scale']
-        sampler = sampler_class(self.num_timesteps, **sampler_kwargs)
-
-        sampler.set_timesteps(nfe, sigmas=sigmas, seq_len=seq_len, device=device)
+        sampler = self._build_sampler(x_t_src, cfg, default_sampler='FlowMapSDE')
         timesteps = sampler.timesteps
         timesteps_dst = sampler.timesteps_dst
+        nfe = len(timesteps)
 
-        x_t_src = timesteps[0] / self.num_timesteps * x_t_src
-
-        if show_pbar:
-            pbar = mmcv.ProgressBar(self.distill_steps)
+        pbar = tqdm_cls(None, total=len(timesteps)) if show_pbar else tqdm.tqdm(disable=True)
 
         # ========== Main sampling loop ==========
         for step_id in range(nfe):
@@ -233,13 +221,9 @@ class PiFlowImitationBase(GaussianFlow):
                     x_t_src, sigma_t_src, raw_t_src, raw_t_dst,
                     self.timestep_sampler, seq_len=seq_len, total_substeps=total_substeps)
 
-            x_t_src = sampler.step(x_t_dst, t_src, x_t_src, return_dict=False)[0]
+            x_t_src = sampler.step(x_t_dst, t_src, x_t_src, generator=generator, return_dict=False)[0]
 
-            if show_pbar:
-                pbar.update()
-
-        if show_pbar:
-            sys.stdout.write('\n')
+            pbar.update()
 
         return x_t_src.to(ori_dtype)
 
@@ -328,12 +312,12 @@ class PiFlowImitationDataFree(PiFlowImitationBase):
             teacher_ratio = 0.0
             log_vars = dict()
 
-        x_t_src = torch.randn_like(x_0)
         raw_t_src = torch.ones((num_batches,), dtype=torch.float32, device=device)
-        step_states = dict(
-            step_id=0,
-            terminate=False,
-            detachable=True,
+        x_t_src = torch.randn_like(x_0)
+
+        # fixed number of steps; declaring num_steps enables DDP no_sync on non-final steps
+        step_states = PiFlowState(
+            num_steps=self.train_cfg['nfe'],
             teacher_ratio=teacher_ratio,
             x_t_src=x_t_src,
             raw_t_src=raw_t_src,
@@ -343,10 +327,10 @@ class PiFlowImitationDataFree(PiFlowImitationBase):
 
     def forward_train(
             self, x_0, step_states=None, teacher=None, teacher_kwargs=dict(), running_status=None, **kwargs):
-        step_id = step_states['step_id']
-        teacher_ratio = step_states['teacher_ratio']
-        x_t_src = step_states['x_t_src']
-        raw_t_src = step_states['raw_t_src']
+        step_id = step_states.step_id
+        teacher_ratio = step_states.teacher_ratio
+        x_t_src = step_states.x_t_src
+        raw_t_src = step_states.raw_t_src
 
         num_batches = x_t_src.size(0)
         seq_len = x_t_src.shape[2:].numel()
@@ -385,11 +369,7 @@ class PiFlowImitationDataFree(PiFlowImitationBase):
         })
 
         if step_id < nfe - 1:
-            step_states.update(
-                step_id=step_id + 1,
-                x_t_src=x_t_dst,
-                raw_t_src=raw_t_dst)
-        else:
-            step_states.update(terminate=True)
+            step_states.x_t_src = x_t_dst
+            step_states.raw_t_src = raw_t_dst
 
         return loss, log_vars, step_states

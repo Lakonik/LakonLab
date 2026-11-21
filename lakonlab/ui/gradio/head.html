@@ -1,0 +1,8 @@
+<!-- Shared <head> content for the Gradio demos, passed as launch(head_paths=...). -->
+<script>
+// Gradio's fullscreen button fullscreens the bare <video>, leaving its seek bar behind, so show the native controls
+// on whichever video is fullscreen
+document.addEventListener('fullscreenchange', () => {
+    document.querySelectorAll('video').forEach((video) => { video.controls = document.fullscreenElement === video; });
+});
+</script>

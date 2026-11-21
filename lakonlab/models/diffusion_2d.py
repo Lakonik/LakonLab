@@ -36,8 +36,7 @@ class Diffusion2D(BaseModel):
                     self.diffusion_ema = build_module(diffusion_ema)
                 if tie_ema:
                     tie_untrained_submodules(self.diffusion_ema, self.diffusion)
-                else:
-                    untie_all_parameters(self.diffusion_ema, self.diffusion)
+                untie_all_parameters(self.diffusion_ema, self.diffusion, preserve_tied=tie_ema)
                 clone_params(self.diffusion_ema, self.diffusion)
 
         self.train_cfg = dict() if train_cfg is None else deepcopy(train_cfg)
@@ -55,18 +54,19 @@ class Diffusion2D(BaseModel):
         return log_vars, bs
 
     def val_step(self, data, test_cfg_override=dict(), **kwargs):
-        bs = data['x'].size(0)
         cfg = deepcopy(self.test_cfg)
         cfg.update(test_cfg_override)
         diffusion = self.diffusion_ema if self.diffusion_use_ema else self.diffusion
 
         with torch.no_grad():
+            bs = data['x'].size(0)
             if 'noise' in data:
                 noise = data['noise'].reshape(bs, 2, 1, 1)
             else:
                 noise = torch.randn((bs, 2, 1, 1), device=data['x'].device)
             x_out = diffusion(
                 noise=noise,
-                test_cfg_override=test_cfg_override)
+                test_cfg_override=test_cfg_override,
+                **kwargs)
 
             return dict(num_samples=bs, pred_x=x_out)

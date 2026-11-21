@@ -2,6 +2,7 @@
 
 import torch
 from .base import BasePolicy
+from lakonlab.ops import adaptive_grad_norm_split
 
 
 class DXPolicy(BasePolicy):
@@ -12,6 +13,7 @@ class DXPolicy(BasePolicy):
 
     Args:
         denoising_output (torch.Tensor): The output of the denoising model. Shape (B, N, C, H, W) or (B, N, C, T, H, W).
+            Tensors without the N dimension are treated as N=1.
         x_t_src (torch.Tensor): The initial noisy sample. Shape (B, C, H, W) or (B, C, T, H, W).
         sigma_t_src (torch.Tensor): The initial noise level. Shape (B,).
         segment_size (float): The size of each DX policy time segment. Defaults to 1.0.
@@ -42,6 +44,8 @@ class DXPolicy(BasePolicy):
         self.raw_t_dst = (self.raw_t_src - segment_size).clamp(min=0)
         self.segment_size = (self.raw_t_src - self.raw_t_dst).clamp(min=eps)
 
+        if denoising_output.dim() == self.ndim:
+            denoising_output = denoising_output.unsqueeze(1)
         denoising_output_x_0 = self._u_to_x_0(
             denoising_output, self.x_t_src, self.sigma_t_src)
         if mode == 'polynomial':
@@ -117,6 +121,15 @@ class DXPolicy(BasePolicy):
         new_policy.segment_size = self.segment_size
         new_policy.denoising_output_x_0 = self.denoising_output_x_0
         return new_policy
+
+    def adaptive_grad_norm_split(self, ratio, min_scale=1e-4, max_scale=1e4):
+        main_output, aux_output = adaptive_grad_norm_split(
+            self.denoising_output_x_0, ratio, min_scale, max_scale)
+        main_policy = self.copy()
+        aux_policy = self.copy()
+        main_policy.denoising_output_x_0 = main_output
+        aux_policy.denoising_output_x_0 = aux_output
+        return main_policy, aux_policy
 
     def detach_(self):
         self.denoising_output_x_0 = self.denoising_output_x_0.detach()

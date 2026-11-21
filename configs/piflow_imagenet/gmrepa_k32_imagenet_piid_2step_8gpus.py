@@ -162,5 +162,4 @@ load_from = None
 resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]
 module_wrapper = 'ddp'
-cudnn_benchmark = True
 mp_start_method = 'fork'

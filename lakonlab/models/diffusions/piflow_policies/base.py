@@ -7,6 +7,10 @@ import torch
 class BasePolicy(metaclass=ABCMeta):
 
     @abstractmethod
+    def adaptive_grad_norm_split(self, ratio, min_scale=1e-4, max_scale=1e4):
+        pass
+
+    @abstractmethod
     def pi(self, x_t, sigma_t):
         """Compute the flow velocity at (x_t, t).
 
