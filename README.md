@@ -125,7 +125,7 @@ Additional notes:
   CUTLASS_PATH=<PATH_TO_CUTLASS> BUILD_EXT=quant,gmflow_ops uv pip install -e . --no-build-isolation
   ```
 
-- To use the optional GMuon optimizer, install LakonLab with the `gmuon` extra.
+- To use the optional [GMuon](https://github.com/Dao-AILab/gram-newton-schulz) optimizer, install LakonLab with the `gmuon` extra.
 
 - To access FLUX models, please accept the [FLUX.2 klein Base 9B conditions](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) and [FLUX.1 dev conditions](https://huggingface.co/black-forest-labs/FLUX.1-dev), and then run `hf auth login` to login with your HuggingFace account.
 
@@ -185,6 +185,22 @@ LakonLab uses the configuration system and code structure from [MMCV](https://gi
 
 ## Citation
 ```
+@misc{chen2026pih3,
+  title        = {{pi-H3: Video Generation in 2–4 Steps Without a VAE Decoder}},
+  author       = {Hansheng Chen and Shengqu Cai and Jiaming Song and Gordon Wetzstein and Xinchen Yan and Leonidas Guibas},
+  year         = {2026},
+  month        = nov,
+  howpublished = {\url{https://hanshengchen.com/blog/pi-h3/}}
+}
+
+@article{chen2026decoding,
+  title={Decoding Without a Decoder: Direct Pixel Prediction from Diffusion Transformers},
+  author={Hansheng Chen and Shengqu Cai and Jan Ackermann and Rayhan Zirvi and Gordon Wetzstein and Xinchen Yan and Leonidas Guibas},
+  journal={arXiv preprint arXiv:2611.22287},
+  url={https://arxiv.org/abs/2611.22287},
+  year={2026},
+}
+
 @article{asymflow,
   title={Asymmetric Flow Models},
   author={Hansheng Chen and Jan Ackermann and Minseo Kim and Gordon Wetzstein and Leonidas Guibas},
